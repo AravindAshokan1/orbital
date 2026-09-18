@@ -206,7 +206,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		ejv, err := auth.NewExternalJWTVerifier(context.Background(), auth.ExternalJWTConfig{
 			IssuerURL:   cfg.JWTIssuer,
 			Audience:    cfg.JWTAudience,
-			ClientID:    cfg.JWTClientID,
+			ClientIDs:   cfg.JWTClientIDs,
 			DefaultRole: cfg.JWTDefaultRole,
 			Fallback:    fallback,
 		})

@@ -29,7 +29,7 @@ func buildExternalJWTVerifier(t *testing.T, issuerURL, audience, clientID, defau
 	v, err := NewExternalJWTVerifier(context.Background(), ExternalJWTConfig{
 		IssuerURL:   issuerURL,
 		Audience:    audience,
-		ClientID:    clientID,
+		ClientIDs:   []string{clientID},
 		DefaultRole: defaultRole,
 	})
 	if err != nil {
@@ -467,7 +467,7 @@ func TestExternalJWT_FallbackRoutesByIssuer(t *testing.T) {
 	ejv, err := NewExternalJWTVerifier(context.Background(), ExternalJWTConfig{
 		IssuerURL:   kcIssuer,
 		Audience:    "account",
-		ClientID:    "aep-fleet-commander",
+		ClientIDs:   []string{"aep-fleet-commander"},
 		DefaultRole: "admin",
 		Fallback:    bv,
 	})
@@ -588,4 +588,76 @@ func TestExternalJWT_DefaultRoleDev(t *testing.T) {
 		}
 		return nil
 	})(c)
+}
+
+// TestExternalJWT_MultipleAZP pins the multi-client behaviour: ORBITAL_JWT_CLIENT_ID
+// accepts a comma-separated list so two callers on the same realm — AEP's client
+// and orbital's own, which the bundler authenticates as — can both reach the API
+// without either one's token widening the anchor for unrelated realm clients.
+func TestExternalJWT_MultipleAZP(t *testing.T) {
+	issuerURL, sign := newTestOIDCServer(t)
+	v, err := NewExternalJWTVerifier(context.Background(), ExternalJWTConfig{
+		IssuerURL:   issuerURL,
+		Audience:    "account",
+		ClientIDs:   []string{"aep-fleet-commander", "armada-orbital"},
+		DefaultRole: "admin",
+	})
+	if err != nil {
+		t.Fatalf("NewExternalJWTVerifier: %v", err)
+	}
+
+	for _, tc := range []struct {
+		azp        string
+		wantCalled bool
+	}{
+		{azp: "aep-fleet-commander", wantCalled: true},
+		{azp: "armada-orbital", wantCalled: true},
+		{azp: "some-other-client", wantCalled: false},
+		{azp: "", wantCalled: false},
+	} {
+		t.Run("azp="+tc.azp, func(t *testing.T) {
+			token := sign(map[string]any{
+				"iss": issuerURL,
+				"aud": "account",
+				"azp": tc.azp,
+				"sub": "s",
+				"exp": time.Now().Add(time.Hour).Unix(),
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			c, rec := echoCtx(req)
+
+			called := false
+			_ = v.RequireAuth()(func(c echo.Context) error {
+				called = true
+				return nil
+			})(c)
+
+			if called != tc.wantCalled {
+				t.Errorf("azp %q: called=%v, want %v", tc.azp, called, tc.wantCalled)
+			}
+			if !tc.wantCalled && rec.Code != http.StatusUnauthorized {
+				t.Errorf("azp %q: expected 401, got %d", tc.azp, rec.Code)
+			}
+		})
+	}
+}
+
+// TestClientIDSet_SkipsBlanks guards the empty-azp hole: a trailing comma in
+// ORBITAL_JWT_CLIENT_ID must not put "" in the accepted set, or a token with no
+// azp claim would authorize.
+func TestClientIDSet_SkipsBlanks(t *testing.T) {
+	set := clientIDSet([]string{"a", "", "  ", " b "})
+	if len(set) != 2 {
+		t.Fatalf("expected 2 entries, got %d: %v", len(set), set)
+	}
+	for _, want := range []string{"a", "b"} {
+		if _, ok := set[want]; !ok {
+			t.Errorf("missing %q in %v", want, set)
+		}
+	}
+	if _, ok := set[""]; ok {
+		t.Error("empty string must not be an accepted azp")
+	}
 }
