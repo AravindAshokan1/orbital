@@ -16,6 +16,7 @@ import (
 	"github.com/armada/orbital/internal/auth"
 	"github.com/armada/orbital/internal/bundler"
 	"github.com/armada/orbital/internal/config"
+	"github.com/armada/orbital/internal/dgraphschema"
 	"github.com/armada/orbital/internal/divergenceingest"
 	"github.com/armada/orbital/internal/handler"
 	"github.com/armada/orbital/internal/metrics"
@@ -35,8 +36,21 @@ type Server struct {
 	cfg                *config.Config
 	echo               *echo.Echo
 	logger             *slog.Logger
+	db                 *ent.Client                // for the job reaper, started in Start()
+	rawDB              *sql.DB                    // advisory locks; nil disables them
 	backupHandler      *handler.BackupHandler     // non-nil when S3 is configured; started in Start()
 	divergenceIngester *divergenceingest.Ingester // non-nil when ORBITAL_DIVERGENCE_INGEST_ENABLED=true and S3 reachable; started in Start()
+}
+
+// jobLeaseFromConfig maps the env-sourced durations onto the handler package's
+// lease config. Lives here rather than on config.Config so the config package
+// never has to import handler.
+func jobLeaseFromConfig(cfg *config.Config) handler.JobLeaseConfig {
+	return handler.JobLeaseConfig{
+		HeartbeatInterval: cfg.JobHeartbeatInterval,
+		StaleAfter:        cfg.JobStaleAfter,
+		OrphanGrace:       cfg.JobOrphanGrace,
+	}
 }
 
 func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
@@ -44,7 +58,11 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 	var backupHandler *handler.BackupHandler
 
 	handler.ReconcileAdminEmails(context.Background(), db, cfg.AdminEmailSet(), logger)
-	handler.ReconcileStaleJobs(context.Background(), db, logger)
+	// Stale jobs are NOT swept here. Doing it at boot fails every running job
+	// on the assumption that a process starting means none can be alive —
+	// true at one replica, destructive at two, where a second pod booting
+	// would kill the first pod's in-flight restore mid-drop_all. The reaper
+	// runs on a ticker from Start() and decides death by stale heartbeat.
 
 	e := echo.New()
 	e.HideBanner = true
@@ -64,8 +82,15 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 
 	// Rate limiting (audit S.12) — opt-in via ORBITAL_RATE_LIMIT_ENABLED, so
 	// local dev, e2e, and the AKS-dev smoke suite are never throttled;
-	// production enables it explicitly. Per-IP token buckets, in-memory
-	// (orbital is single-replica). Denials return a 429 that the central
+	// production enables it explicitly. Per-IP token buckets, in-memory.
+	//
+	// APPROXIMATE AT MULTIPLE REPLICAS, deliberately. Buckets are per-pod, so
+	// the effective ceiling is ORBITAL_RATE_LIMIT_RPS x replicas — including
+	// the tighter login bucket below. Divide the configured value by the
+	// expected replica count. Making it exact would require shared state,
+	// which promotes Valkey from optimisation to hard dependency and
+	// contradicts a settled decision; an approximate limit that degrades
+	// gracefully is the better trade. See docs/reference/CONFIG.md. Denials return a 429 that the central
 	// ErrorHandler renders as the standard envelope (code RATE_LIMITED), with a
 	// Retry-After header. A tighter bucket is attached to POST /user/login
 	// below to slow credential brute-force. loginRateLimiter stays nil (and the
@@ -188,8 +213,18 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		if err != nil {
 			logger.Error("external-jwt verifier init failed — API auth disabled", "err", err)
 		} else {
+			// Every bearer caller gets this one tier, so an operator who never
+			// set it should see that they inherited it rather than chose it.
+			// Warned, not refused: readonly is a safe fallback, and refusing to
+			// boot is for guarantees with no safe default (see apiAuth below).
+			_, roleWasSet := os.LookupEnv("ORBITAL_JWT_DEFAULT_ROLE")
+			if !roleWasSet {
+				logger.Warn("ORBITAL_JWT_DEFAULT_ROLE not set — defaulting to "+cfg.JWTDefaultRole+"; every valid bearer token receives this role. Set it explicitly to choose the tier.",
+					"role", cfg.JWTDefaultRole, "explicitly_set", false)
+			}
 			logger.Warn("ORBITAL_AUTH_MODE=external-jwt — Keycloak bearers (issuer "+cfg.JWTIssuer+") map to role "+cfg.JWTDefaultRole+"; other issuers fall back to AAD bearer auth. Intended for demo/dev; do not use in production without per-user role mapping.",
-				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_ids", cfg.JWTClientIDs, "aad_fallback", fallback != nil)
+				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_id", cfg.JWTClientID,
+				"aad_fallback", fallback != nil, "role_explicitly_set", roleWasSet)
 			apiAuth = []echo.MiddlewareFunc{ejv.RequireAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
 		}
 	case cfg.OIDCIssuerURL != "":
@@ -391,12 +426,15 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		})
 	root.GET("/network/:orbId", networkDevice.Tab)
 
-	delH := handler.NewDeleteHandler(cfg.DGraphURL, db, logger)
+	// gql is passed for the approval gate only — this endpoint writes via DQL,
+	// so it cannot reach the check through writeToDGraph's chokepoint.
+	delH := handler.NewDeleteHandler(cfg.DGraphURL, db, logger, gql)
 	root.GET("/config-items/delete-preview", delH.Preview)
 	api.DELETE("/config-items/:type/:id", delH.Execute)
 
 	if db != nil {
 		exp := handler.NewExport(db, cfg.DGraphURL, cfg.DGraphScratchURL, cfg.DGraphScratchAdminURL, cfg.DGraphScratchZeroURL, cfg.ExportDir, cfg.DGraphScratchExportDir, cfg.SchemaPath, logger)
+		exp.SetJobCoordination(jobLeaseFromConfig(cfg), rawDB)
 		exp.SetBasePath(cfg.BasePath)
 		exp.SetTimeout(cfg.ExportTimeout)
 		api.POST("/export", exp.Trigger)
@@ -482,6 +520,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 				api.GET("/backup/jobs/:jobId/download", bk.Download)
 				api.DELETE("/backup/jobs/:jobId", bk.Delete)
 				api.POST("/backup/test-connection", bk.TestConnection)
+				bk.SetJobCoordination(jobLeaseFromConfig(cfg), rawDB)
 				backupHandler = bk
 			}
 
@@ -504,6 +543,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 
 				api.GET("/restore/jobs/:jobId", rh.Status)
 				api.POST("/restore", rh.Trigger)
+				rh.SetJobCoordination(jobLeaseFromConfig(cfg), rawDB)
 			}
 		}
 
@@ -598,6 +638,8 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		cfg:                cfg,
 		echo:               e,
 		logger:             logger,
+		db:                 db,
+		rawDB:              rawDB,
 		backupHandler:      backupHandler,
 		divergenceIngester: divIngester,
 	}, nil
@@ -641,6 +683,17 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.divergenceIngester != nil {
 		go s.divergenceIngester.Start(ctx)
 	}
+
+	// Every replica runs the reaper; the advisory lock inside each sweep means
+	// only one does the work on any given tick.
+	go handler.StartReaper(ctx, s.db, s.rawDB, jobLeaseFromConfig(s.cfg), s.logger)
+
+	// Report, once, whether DGraph is actually running the schema this build
+	// ships. Orbital does not apply it (docs/reference/DGRAPH.md § Schema rules),
+	// so a schema-bumping deploy reaches a DGraph still on the old schema unless
+	// someone runs the manual step — and until this check existed, forgetting
+	// produced no signal until users hit 404s.
+	dgraphschema.StartCheck(ctx, s.cfg.DGraphAdminURL, s.cfg.SchemaPath, s.logger)
 
 	select {
 	case err := <-errCh:

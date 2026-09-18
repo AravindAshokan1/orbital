@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -284,7 +285,10 @@ func (h *UI) buildMenuSections(path, userRole string, pendingDivergences int) []
 				// to know whether this caller can approve it, and the menu is on
 				// every page. Computing it inline would make every page load pay
 				// for a change-request scan.
-				BadgeSrc: "/api/v1/change-requests?awaiting_review=true",
+				// limit=0: the badge reads only `total`, so there is no reason to
+				// transfer every matching request's changes/record/reviews to
+				// render one number — on every page in the app.
+				BadgeSrc: "/api/v1/change-requests?awaiting_review=true&limit=0",
 			},
 		}
 		// readonly+, matching the API: apiReadonly serves GET /approval-policies,
@@ -667,12 +671,20 @@ func (h *UI) Schema(c echo.Context) error {
 		return fmt.Errorf("read schema version: %w", err)
 	}
 	sum := sha256.Sum256([]byte(sdl))
+	// The SDL above is what DGraph is RUNNING; version is what this build
+	// SHIPS. Orbital never applies the schema, so showing the two side by side
+	// without saying whether they agree is how a v8 graph gets captioned "v9".
+	var drift []string
+	if shipped, err := os.ReadFile(h.schemaPath); err == nil {
+		drift = dgraphschema.Drift(string(shipped), sdl)
+	}
 	return h.render(c, "schema", page.Schema{
 		Base:      h.base(c),
 		PageTitle: "Schema",
 		Version:   version,
 		Checksum:  fmt.Sprintf("%x", sum[:6]),
 		SDL:       sdl,
+		Drift:     drift,
 	})
 }
 
