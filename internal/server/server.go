@@ -223,7 +223,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 					"role", cfg.JWTDefaultRole, "explicitly_set", false)
 			}
 			logger.Warn("ORBITAL_AUTH_MODE=external-jwt — Keycloak bearers (issuer "+cfg.JWTIssuer+") map to role "+cfg.JWTDefaultRole+"; other issuers fall back to AAD bearer auth. Intended for demo/dev; do not use in production without per-user role mapping.",
-				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_id", cfg.JWTClientID,
+				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_ids", cfg.JWTClientIDs,
 				"aad_fallback", fallback != nil, "role_explicitly_set", roleWasSet)
 			apiAuth = []echo.MiddlewareFunc{ejv.RequireAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
 		}
