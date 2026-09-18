@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
@@ -41,7 +42,7 @@ import (
 type ExternalJWTVerifier struct {
 	verifier    *gooidc.IDTokenVerifier
 	issuer      string
-	clientID    string
+	clientIDs   map[string]struct{}
 	defaultRole string
 
 	// fallback verifies bearers whose `iss` is NOT this verifier's issuer —
@@ -56,7 +57,7 @@ type ExternalJWTVerifier struct {
 type ExternalJWTConfig struct {
 	IssuerURL   string
 	Audience    string
-	ClientID    string          // required `azp` claim value (RFC 9068 client_id)
+	ClientIDs   []string        // accepted `azp` claim values (RFC 9068 client_id); any one of them authorizes
 	DefaultRole string          // "readonly" | "dev" | "admin"
 	Fallback    *BearerVerifier // optional: verifies bearers from other issuers (AAD service tokens)
 }
@@ -69,10 +70,32 @@ func NewExternalJWTVerifier(ctx context.Context, cfg ExternalJWTConfig) (*Extern
 	return &ExternalJWTVerifier{
 		verifier:    provider.Verifier(&gooidc.Config{ClientID: cfg.Audience}),
 		issuer:      cfg.IssuerURL,
-		clientID:    cfg.ClientID,
+		clientIDs:   clientIDSet(cfg.ClientIDs),
 		defaultRole: cfg.DefaultRole,
 		fallback:    cfg.Fallback,
 	}, nil
+}
+
+// clientIDSet builds the accepted-azp lookup, skipping blanks so a trailing
+// comma in ORBITAL_JWT_CLIENT_ID cannot authorize an empty azp claim.
+func clientIDSet(ids []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
+// authorizedClients returns the accepted azp values, sorted, for log messages.
+func (v *ExternalJWTVerifier) authorizedClients() []string {
+	ids := make([]string, 0, len(v.clientIDs))
+	for id := range v.clientIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // RequireAuth is an Echo middleware that accepts either a valid Bearer token or
@@ -121,13 +144,13 @@ func (v *ExternalJWTVerifier) verifyBearer(c echo.Context, next echo.HandlerFunc
 		return v.deny(c, oauthErrInvalidToken, "unable to parse token claims: "+err.Error())
 	}
 
-	if claims.AZP != v.clientID {
+	if _, ok := v.clientIDs[claims.AZP]; !ok {
 		// Verify() succeeded, so the signature is valid and these claims are
 		// authentic — safe to attribute the identity the token was minted for.
 		slog.Warn("external-jwt rejected — azp mismatch",
 			"request.id", requestID(c),
 			"azp", claims.AZP,
-			"expected_azp", v.clientID,
+			"expected_azp", v.authorizedClients(),
 			"subject", claims.Sub,
 			"user_email", claims.actorEmail(),
 			"client.address", c.RealIP(),

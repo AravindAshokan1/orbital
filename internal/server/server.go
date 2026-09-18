@@ -181,7 +181,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		ejv, err := auth.NewExternalJWTVerifier(context.Background(), auth.ExternalJWTConfig{
 			IssuerURL:   cfg.JWTIssuer,
 			Audience:    cfg.JWTAudience,
-			ClientID:    cfg.JWTClientID,
+			ClientIDs:   cfg.JWTClientIDs,
 			DefaultRole: cfg.JWTDefaultRole,
 			Fallback:    fallback,
 		})
@@ -189,7 +189,7 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 			logger.Error("external-jwt verifier init failed — API auth disabled", "err", err)
 		} else {
 			logger.Warn("ORBITAL_AUTH_MODE=external-jwt — Keycloak bearers (issuer "+cfg.JWTIssuer+") map to role "+cfg.JWTDefaultRole+"; other issuers fall back to AAD bearer auth. Intended for demo/dev; do not use in production without per-user role mapping.",
-				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_id", cfg.JWTClientID, "aad_fallback", fallback != nil)
+				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_ids", cfg.JWTClientIDs, "aad_fallback", fallback != nil)
 			apiAuth = []echo.MiddlewareFunc{ejv.RequireAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
 		}
 	case cfg.OIDCIssuerURL != "":

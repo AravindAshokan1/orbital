@@ -136,7 +136,7 @@ type Config struct {
 	AuthMode                string        `envconfig:"ORBITAL_AUTH_MODE"               default:""`
 	JWTIssuer               string        `envconfig:"ORBITAL_JWT_ISSUER"              default:""`      // e.g. https://keycloak.example.com/realms/foo
 	JWTAudience             string        `envconfig:"ORBITAL_JWT_AUDIENCE"            default:""`      // expected `aud` claim
-	JWTClientID             string        `envconfig:"ORBITAL_JWT_CLIENT_ID"           default:""`      // required `azp` claim — the trust anchor when aud is a generic default like "account"
+	JWTClientIDs            []string      `envconfig:"ORBITAL_JWT_CLIENT_ID"           default:""`      // accepted `azp` claims, comma-separated — the trust anchor when aud is a generic default like "account"
 	JWTDefaultRole          string        `envconfig:"ORBITAL_JWT_DEFAULT_ROLE"        default:"admin"` // role every valid token maps to: readonly | dev | admin
 	OCIRegistry             string        `envconfig:"ORBITAL_OCI_REGISTRY"            default:"localhost:5001"`
 	OCIRepo                 string        `envconfig:"ORBITAL_OCI_REPO"                default:"orbital"`
@@ -185,7 +185,7 @@ func New() (*Config, error) {
 		return nil, fmt.Errorf("ORBITAL_SESSION_HMAC_KEY must be set to a secret value in production (ORBITAL_DEV=false)")
 	}
 	if cfg.AuthMode == "external-jwt" {
-		if cfg.JWTIssuer == "" || cfg.JWTAudience == "" || cfg.JWTClientID == "" {
+		if cfg.JWTIssuer == "" || cfg.JWTAudience == "" || len(cfg.JWTClientIDs) == 0 {
 			return nil, fmt.Errorf("ORBITAL_AUTH_MODE=external-jwt requires ORBITAL_JWT_ISSUER, ORBITAL_JWT_AUDIENCE, ORBITAL_JWT_CLIENT_ID")
 		}
 		switch cfg.JWTDefaultRole {
