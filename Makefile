@@ -45,7 +45,7 @@ up: ## Start the local stack (DGraph, Postgres, MinIO, Zot, orb DGraph)
 	@# host path is missing at start, Docker binds a directory that only exists
 	@# inside its VM, and DGraph's native export fails with the unhelpful
 	@# "resolving export failed because task failed".
-	@mkdir -p /tmp/orbital-test-blue /tmp/orbital-test-scratch /tmp/orbital-test-main
+	@mkdir -p .local/exports/blue .local/exports/scratch .local/exports/test
 	docker compose -f $(COMPOSE_FILE) up -d
 	@# `make down` runs -v and wipes the Postgres volume, taking orbital_test with
 	@# it. Recreating here means `make up` leaves you ready to run anything,
@@ -60,6 +60,16 @@ down: ## Stop the local stack (all profiles)
 	docker compose -f $(COMPOSE_FILE) --profile '*' down -v
 
 run-orbital: fmt ## Run orbital server (go run; fast dev iteration). Restore requires dgraph in PATH
+	@# macOS prunes /tmp periodically, and when it removes an export DIRECTORY
+	@# underneath a running container the bind mount goes stale: the mount was
+	@# resolved at container start, so it still references the old inode and the
+	@# two sides stop agreeing about that path. Recreating the directory on the
+	@# host does NOT repair it — the fix is restarting the container, which is
+	@# why `make up`'s mkdir only helps at start. The symptom otherwise lands much
+	@# later as a backup failing with "no json.gz found after export", so check it
+	@# when a developer can still act on it. Warn rather than block: only export,
+	@# backup and restore need these mounts.
+	@bash scripts/check-export-mounts.sh || true
 	@# DOCKER_CONFIG isolation: prevents cosign's go-containerregistry keychain
 	@# from spawning docker-credential-* helpers (which on macOS live inside
 	@# /Applications/Docker.app/). Spawning from iTerm's process tree triggers
@@ -71,26 +81,30 @@ run-orbital: fmt ## Run orbital server (go run; fast dev iteration). Restore req
 	@# tenant/client/secret that config.go deliberately does not default. Absent is
 	@# fine — orbital runs and password login works, so a fresh clone needs no setup.
 	@[ -f deploy/local/orbital.env ] && echo "sourcing deploy/local/orbital.env (local SSO enabled)" || true
+	@# Local session key. The binary refuses the placeholder literal that used to
+	@# live in the code default, because it is published in this repo and is
+	@# therefore a secret nobody has. Generated once and reused, so sessions
+	@# survive a restart — a per-run random key would log the developer out on
+	@# every `make run-orbital`. deploy/local/*.key is already gitignored, same
+	@# as cosign.key.
+	@[ -f deploy/local/session-hmac.key ] || { \
+		mkdir -p deploy/local && openssl rand -hex 32 > deploy/local/session-hmac.key && \
+		echo "generated deploy/local/session-hmac.key"; }
+	@# Developer posture lives HERE, not in the binary's defaults. ORBITAL_DEV
+	@# used to supply all of this implicitly and also switched API auth off,
+	@# which meant an operator who configured nothing got no auth. The binary now
+	@# defaults to auth ON and hot-reload OFF; this target opts into the dev
+	@# values, and deploy/local/orbital.env still wins over both (`:-` only fills
+	@# a value that is unset).
 	if [ -f deploy/local/orbital.env ]; then set -a; . ./deploy/local/orbital.env; set +a; fi; \
+	export ORBITAL_TEMPLATE_HOT_RELOAD_ENABLED="$${ORBITAL_TEMPLATE_HOT_RELOAD_ENABLED:-true}"; \
+	export ORBITAL_API_AUTH_ENABLED="$${ORBITAL_API_AUTH_ENABLED:-false}"; \
+	export ORBITAL_SESSION_HMAC_KEY="$${ORBITAL_SESSION_HMAC_KEY:-$$(cat deploy/local/session-hmac.key)}"; \
 	DOCKER_CONFIG=$$(mktemp -d) go run -ldflags "-X $(MODULE)/internal/version.Version=v0.0.0-dev" ./cmd/orbital
 
-run-orbital-aep: fmt ## Run orbital in external-jwt mode (accepts AEP/Keycloak bearers as admin) on :8001
-	@# Vars are set IN the recipe so they always reach the process — no
-	@# fragile shell-prefix env that breaks when pasted across lines.
-	@# SSO login + bundler publish need env you export YOURSELF first (both talk
-	@# to external processes, so you decide when they're on):
-	@#   export ORBITAL_OIDC_CLIENT_SECRET=...    # Keycloak client secret
-	@#   export ORBITAL_BUNDLER_URLS=configbundle-bundler=http://localhost:8020/bundle
-	@# The recipe inherits exported vars; omit them and orbital still runs.
-	DOCKER_CONFIG=$$(mktemp -d) \
-	ORBITAL_AUTH_MODE=external-jwt \
-	ORBITAL_JWT_ISSUER=https://keycloak.devnew.armada.ai/realms/armada \
-	ORBITAL_JWT_AUDIENCE=account \
-	ORBITAL_JWT_CLIENT_ID=aep-fleet-commander \
-	ORBITAL_JWT_DEFAULT_ROLE=admin \
-	go run -ldflags "-X $(MODULE)/internal/version.Version=v0.0.0-dev" ./cmd/orbital
-
 run-orb: fmt ## Run orb edge service (go run; fast dev iteration). Import requires dgraph in PATH
+	@# Same split as orbital: hot-reload is opted into here, not defaulted in the binary.
+	ORB_TEMPLATE_HOT_RELOAD_ENABLED="$${ORB_TEMPLATE_HOT_RELOAD_ENABLED:-true}" \
 	go run -ldflags "-X $(MODULE)/internal/version.Version=v0.0.0-dev" ./cmd/orb start
 
 seed: ## Seed DGraph with example data + admin user (local)
@@ -135,6 +149,16 @@ e2e-divergence: ## E2E divergence flow: export→publish→orb import→SSA over
 	bash scripts/e2e-divergence.sh
 
 release-check: ## Build images, start containers, perform e2e (set version; VERSION=v0.0.18)
+	@# Fail fast on the one prerequisite this target cannot start itself: the
+	@# bundler lives in the sibling configbundle repo, and the containerised
+	@# orbital publishes through host.docker.internal:8020. Without it the run
+	@# gets ~20 minutes in and dies with `connection refused` at the publish
+	@# step — a long way from the cause.
+	@lsof -ti :8020 >/dev/null 2>&1 || { \
+		echo "ERROR: nothing listening on :8020 — the bundler must be running."; \
+		echo "       cd ../configbundle && make run-bundler"; \
+		echo "       (the release-check orbital container has API auth off, so no credentials are needed)"; \
+		exit 1; }
 	@echo "Building orbital + orb images at VERSION=$(VERSION)"
 	@# DOCKER_CONFIG isolation: same footgun as run-orbital — Docker Desktop's
 	@# credsStore spawns docker-credential-desktop for every image pull/build,

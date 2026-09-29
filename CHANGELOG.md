@@ -22,6 +22,637 @@ what changed. GitHub Release bodies are generated from this file, never the othe
 
 ## [Unreleased]
 
+### Fixed
+- **A cascade delete left the surviving parent pointing at the node it removed,
+  which permanently broke export for that data centre.** orbital deletes through
+  a DQL upsert (`bulkDeleteGuarded`) because that is the only way to get a
+  version-guarded CAS — but `@hasInverse` is a GraphQL-layer construct that
+  DGraph maintains only for mutations through its GraphQL endpoint. A DQL
+  `S * *` delete cleared the child and left `DataCenter.kubernetesClusters`
+  pointing at an empty uid. Any later query walking that edge and selecting a
+  non-nullable field then failed **entirely**, because DGraph propagates the
+  error to the root:
+
+      Non-nullable field 'orbId' (type String!) was not present in result from Dgraph.
+
+  The export subgraph query is exactly that shape, so one cluster delete broke
+  export for its whole DC — while the delete returned `200` with a correct audit
+  event, and the damage surfaced later, in another subsystem, as an error naming
+  neither the delete nor the node. Each delete path now clears the edges held by
+  nodes that SURVIVE it, in the same guarded transaction: `DataCenter.servers`,
+  `Rack.servers` and `KubernetesNode.server` for a server;
+  `DataCenter.kubernetesClusters` for a cluster. (A data centre is the top of its
+  own subtree, so nothing above it holds an edge.)
+  `TestDelete_LeavesNoDanglingParentEdge` reproduces the original failure and is
+  verified to fail without the fix.
+- **Orb's import page showed a blank area instead of "No versions available."**
+  when the OCI registry was empty or unreachable. `import_handlers.go` wrote a
+  bare `<tr>` on that path, and `orb.js` assigns the response into a `<div>`'s
+  `innerHTML` — where the HTML parser discards a `<tr>` that is not inside a
+  table, so the empty state rendered as nothing at all. Both paths now render
+  the same fragment, whose template already carries the message inside `<tbody>`.
+  The e2e suite had been reporting this the whole time; it was read as a known
+  failure.
+- **The Data Center reload button fetched the wrong URL under a base path.**
+  `shared.js` called `fetchWithMinDelay(BASE + '/datacenters/…')`, but that
+  helper already prepends `BASE` — so on a deployment served under `/orbital`
+  the reload requested `/orbital/orbital/datacenters/…` and 404'd. Invisible
+  locally, where `basePath` is empty. The network-device and cluster reloads
+  were already correct; only this one double-prefixed. Found while moving the
+  network-device reload into `shared.js`.
+
+### Fixed
+- **A proposal on `Server.serialNumber` marked the wrong field state.** The
+  `SummaryValuesJSON` map in `server.go` — which supplies the CURRENT value each
+  proposed-change mark compares against — omitted `serialNumber`, directly under
+  a comment reading "Exactly the Server FormFields in configitems/registry.go".
+  A redundant proposal therefore rendered a mark it should not, and a proposal
+  clearing the field rendered none at all. It is the third hand-maintained copy
+  of one field list; `TestServerSummaryValuesMatchRegistry` now compares it to
+  the registry, as `TestServerTabFieldSlotsMatchRegistry` already did for the
+  template.
+- **Nested detail tables stayed pale in dark mode.** orb's publish-history
+  expansion used Bulma's `has-background-white-bis`, an absolute near-white that
+  does not flip with the colour scheme, so light text landed on a light box.
+  Replaced with a scheme-derived `.table-nested`.
+
+### Changed
+- **`make release-check` had been failing since 2026-07-28 and nobody knew.** Its
+  step-7 mutation passed `set` as an inline literal, which orbital's proxy
+  correctly refuses (`VARIABLE_FORM_REQUIRED`) because it cannot stamp
+  `updatedAt`/`updatedBy` or bump `version` into inline values. The reject
+  shipped three weeks after that spec was last touched. Rewritten to the
+  variable form the error's own hint prescribes.
+- **The release-check gate no longer accepts a consumer dispatch failure as
+  success.** `partial` means `dispatchErrors > 0` — a consumer returned non-2xx —
+  but the spec's comment claimed it meant "no consumer registered" (a layer with
+  no consumer is skipped and never counted), and asserted only
+  `.not.toBe('failed')`. Every run *was* partial: `ORB_CONSUMERS` defaults to
+  cb-controller on `localhost:8095`, which inside the orb container is the
+  container itself. The compose file now states `ORB_CONSUMERS="[]"` for an
+  environment that genuinely has no consumers, and the assertion requires
+  `done`, printing per-consumer status codes on failure.
+- **`make release-check` fails in one second when the bundler is not running**,
+  instead of ~20 minutes in with `connection refused`. The bundler lives in the
+  sibling configbundle repo and the target cannot start it; the spec's
+  prerequisites block never mentioned it and still described host processes from
+  before this ran against containers.
+
+### Added
+- **`e2e/release-check/y-delete-then-export.spec.ts`** — deletes a cluster, then
+  exports its data centre. This is the seam neither gate covered: the fast e2e
+  suite deletes clusters but never exports, and release-check exported but never
+  deleted, which is how a delete that silently broke export shipped. Verified to
+  fail against a rebuilt image with the fix reverted.
+
+### Changed
+- **`ORBITAL_DEV` is gone, split into per-capability flags.** One boolean named
+  after an audience decided three unrelated things — template hot-reload,
+  whether bearer auth was installed, and whether the placeholder session HMAC
+  key was accepted. A developer who wanted hot-reload also got auth off, and
+  nothing in the name said so. It defaulted to `true`, so the coupling was
+  **fail-open**: configure nothing and you got no API auth, and the fail-closed
+  guard in `server.go` could not catch it because that guard only fires when
+  auth is *required*.
+
+  Replaced by `ORBITAL_TEMPLATE_HOT_RELOAD_ENABLED` (default `false`),
+  `ORBITAL_API_AUTH_ENABLED` (**default `true`**, inheriting from nothing), and
+  an unconditional refusal of the placeholder session key — which is published
+  in this repo and so is a secret nobody has. With `ORBITAL_SESSION_HMAC_KEY`
+  unset, an ephemeral key is generated and said out loud at startup, so a fresh
+  clone still runs with no setup. `ORBITAL_COOKIE_SECURE` was already independent.
+
+  **Developer posture moved into the Makefile**, where it is visible, instead of
+  living in the binary's defaults: `make run-orbital` opts into hot-reload, opts
+  out of API auth, and writes a persistent `deploy/local/session-hmac.key`
+  (gitignored) so sessions survive restarts. Local, containerised and Kubernetes
+  runtimes are unchanged — each now states both halves explicitly.
+  orb's `ORB_DEV` became `ORB_TEMPLATE_HOT_RELOAD_ENABLED` in the same pass; it
+  only ever controlled hot-reload.
+
+### Added
+- **Orb serves network devices.** `/network` and `/network/:orbId` reuse
+  orbital's `NetworkDeviceHandler` with `layout.OrbActions`, matching how orb
+  already serves Data Center, Server and Cluster detail tabs — read-only, no
+  Edit or Delete controls. The Config Items menu gains a Network Devices entry.
+- **`internal/webrender`** — the buffer-then-write HTML render helper, lifted out
+  of `internal/handler` so both server packages can reach it. It was unexported
+  there, so `internal/orbserver` structurally could not call it and every
+  orb-owned page rendered straight into the response: a template referencing a
+  field its render struct lacks committed a `200` with a truncated body, no
+  `500`, nothing logged. Orb's ten pages and its HTMX fragments now buffer like
+  orbital's. (Orb's DC/Server/Cluster detail tabs were already safe — they run
+  through orbital's handlers.)
+- **Regression guards for template drift**, each verified to fail on an injected
+  fault rather than merely passing:
+  `TestAllTemplatesReachable` (a `.gohtml` no parse set references fails the
+  build — seven such files had accumulated), `TestNoDirectTemplateExecuteIntoResponse`
+  (the render rule is enforced in source, not prose), `TestOrbitalPages_AllPathsReturn200`
+  (orbital's counterpart to orb's, which had no equivalent; renders **authenticated**,
+  since an unauthenticated render exercises only the login gate) and
+  `TestOrbitalPages_LoginGateWhenUnauthenticated` for the other branch.
+
+### Changed
+- **One edit-modal template replaces four.** `shared/components/edit-modal.gohtml`
+  renders from `component.EditModal`. The four per-family copies had already
+  drifted into two defects: the network-device modal used `networkdevice` for
+  the modal id and `network-device` for every inner id — the opener keys on one,
+  the editor on the other — and `data-reload-url`/`-target` were carried by
+  cluster and network-device where nothing reads them (only the server opener
+  does). Adding a ConfigItem family is now a handler struct plus one opener,
+  not a five-file copy. Two tests pin it.
+- **One modal-close handler replaces four**, via a prefix-free
+  `data-modal-close` in `shared.js`. The inline `<script>` in `login-modal.gohtml`
+  that previously owned this closed on `.modal-card-foot .button` — harmless as
+  a load-time bind, but as delegation that selector closes an edit modal when
+  **Save** is clicked.
+- **The metadata box is one partial**, not four byte-identical copies across the
+  detail tabs.
+- **`title=""` tooltips are gone** — all 47, across 15 templates and two JS
+  modules, replaced by the house `tooltip` + `data-text` (with a new `is-wide`
+  variant, since the base is `nowrap` and several were full sentences).
+- **Page descriptions use a `.page-description` class** instead of an inline
+  `font-size`, which had produced three different values across three spacings.
+- **Record-list tables all carry the house class** (16 distinct class strings → 9,
+  the remainder being key/value summary tables, which are a different shape).
+- **Inline `style="overflow-x:auto"` replaced by `.table-container`** at all 25 sites.
+- **The Servers, Clusters and Network Devices pages are now one template each,
+  shared by orbital and orb**, in `web/templates/shared/pages/`. The former
+  copies differed only by orbital's login gate — 39 of orb's 39 `servers.gohtml`
+  lines were identical to orbital's — so the gate became conditional on
+  `.UI.ShowAuth` (orb sets it false) via a new `login-gate.gohtml` partial.
+  Template duplication fell from 163 duplicated 8-line blocks to 96.
+- **List-page wiring moved into `shared.js` as `initListPages()`.** `orbital.js`
+  and `orb.js` each carried their own near-identical `DOMContentLoaded` blocks
+  wiring the datacenter, server and cluster tables — ~60 duplicated lines across
+  two files, while `shared.js` already exported every function they called.
+  Cross-file JS duplication between the two app modules is now zero (was 26
+  blocks). Network devices join the same descriptor list, so orb gets that page
+  automatically.
+
+### Changed
+- **The Playwright suite is green again — 106 passing, 0 failing.** Four tests
+  had been failing continuously; each is now fixed at its cause rather than
+  muted. One was a real product bug (orb's empty state, above). One pinned
+  `expect(slots).toBe(6)` on the Server summary table and broke when
+  `serialNumber` and `uHeight` were added *correctly* — a magic number cannot
+  distinguish a properly-added field from a dead mark slot, so the invariant
+  moved to `TestServerTabFieldSlotsMatchRegistry`, which compares the template's
+  `data-field` rows against `configitems.Types` FormFields and names the
+  offending field in either direction. The remaining two asserted against a
+  state the app cannot reach on a freshly-seeded stack: with no approval policy
+  matching, a change request is created already approved, never enters
+  `StatusOpen`, and offers merge/close rather than approve/edit. Both now create
+  the policy they depend on via the existing `policy-snapshot` helpers, so the
+  precondition is stated instead of inherited from whatever a developer had
+  lying around.
+
+### Removed
+- **Seven dead templates.** `form-{cluster,server,user}-create.gohtml`,
+  `delete-modal.gohtml`, `delete-modal-user.gohtml`, `register-modal.gohtml` and
+  orb's `navbar.gohtml` stub — none referenced by any parse set. Two of them
+  both declared `id="delete-modal"`, the id `orbital.js` uses for the live
+  backups delete flow, so adding either to a parse set would have silently bound
+  that flow to the wrong modal. `register-modal.gohtml` also implied a local
+  registration path that `AUTH.md` forbids.
+
+### Fixed
+- **Three browser-login failures redirected to the wrong page under a base path.**
+  `invalid_state`, `no_id_token` and the new nonce refusal redirected to
+  `/?error=…` while every other login error used `basePath + "/?error=…"`. On a
+  deployment served under `/orbital` those three bounced to the cluster root, so
+  the user saw someone else's 404 rather than orbital's sign-in message.
+
+### Changed
+- **Browser-login error codes joined the registry.** `invalid_state`,
+  `no_id_token` and `invalid_nonce` were raw strings while every neighbouring
+  refusal used a registry code, so the login modal rendered them bare instead of
+  as `error — hint`. Now `INVALID_STATE`, `NO_ID_TOKEN` and `INVALID_NONCE`, each
+  with an operator-readable explanation and a row in `ERROR-RESPONSES.md`.
+- **~22 comments citing `ADR 0NN` now cite the domain docs.** `docs/decisions/`
+  was removed on 2026-07-07 and the pointers went with it, leaving code that
+  referred readers to files that had not existed for months — ADR 012 in the
+  divergence paths, ADR 010 in the app-principal paths, 007 in the schema-version
+  note, 002 in the delete handler. Two citations were *removed* rather than
+  repointed: `DIVERGENCE.md` cited the ADR it had absorbed, and a `UI.md` bullet
+  about shared JS navigation cited an ADR about shared ConfigItem handlers in Go —
+  a wrong pointer is worse than a dangling one. The runbook mention stays, since
+  it explains the removal and how to recover the file from git.
+
+- **CSRF protection on cookie-authenticated API calls no longer depends on the
+  client attaching a token** (`internal/auth/csrf.go`). The token guard added in
+  the auth refactor required `X-CSRF-Token` on every non-GET request to
+  `/graphql` and `/api/v1`. `shared.js` attached it for `fetch` and for htmx, but
+  not for the jQuery XHR behind DataTables — so **v0.0.46 returned 403 on the
+  Data Centers, Servers, Clusters and Network list pages**. A token has to be
+  wired into every client transport, and this app has three.
+
+  The guard now reads what an honest client already sends. A stated
+  `Origin` (or `Referer`) is authoritative — same host passes, another host is
+  refused. If a request states neither *and* carries a content type only an HTML
+  form can produce (`application/x-www-form-urlencoded`, `multipart/form-data`,
+  `text/plain`), it is refused; that backstop is what makes the first rule's
+  fail-open safe. `application/json` is unreachable from a cross-site form, and a
+  cross-origin `fetch` sending it triggers a CORS preflight that fails because
+  orbital configures no CORS policy — the same approach as Apollo Server's
+  `csrfPrevention`. No client-side code is involved, so a future transport cannot
+  forget it.
+
+  The order is deliberate: **htmx encodes as `application/x-www-form-urlencoded`
+  by default**, and two `hx-post` attributes target `/api/v1`, so testing content
+  type ahead of `Origin` would have 403'd every htmx mutation — the same failure
+  as the token, from the other direction.
+
+  **Bearer callers stay exempt** — orbctl, AEP Fleet Commander and cb-bundler are
+  unaffected, as before. **Login, logout and register are unaffected**: they POST
+  form-encoded to `root` UI routes outside this group and keep their hidden
+  `csrf` field. Requests with neither `Origin` nor `Referer` are allowed
+  deliberately — a browser always sends `Origin` cross-origin, so their absence
+  means the call did not come from a browser form. `SameSite=Lax` is unchanged.
+
+  `ORBITAL_CONFIG.csrfToken` and the `fetch`/htmx wrappers in `shared.js` are
+  removed. See `docs/reference/AUTH.md` § CSRF on cookie-authenticated API calls.
+
+### Added
+- **`Rack.uHeight`** — rack height in units (`schema/VERSION` → **v11**, apply
+  per cluster). Editable from the DataCenter page and shown as **Height (U)**;
+  unset renders as an em dash, never `0`. Nullable by design — 42U is common but
+  not universal, so orbital records it rather than assuming it.
+
+  **Do not compute a rack's valid unit range as `1..uHeight`** — that needs
+  `startingUnit` and `descUnits`, which orbital does not model yet. See
+  `DGRAPH.md` § Schema rules.
+
+- **`Server.uHeight`** — how many rack units a server occupies (`schema/VERSION`
+  → **v12**, apply per cluster). Pairs with `Rack.uHeight`: how many units the
+  rack has, versus how many a server takes. `Float` and nullable — `0` means a
+  rack-mounted device that consumes no unit, which is not the same as unset.
+  Sizes vary from 1U to 6U, so there is no default. Editable in the config editor
+  and shown on the server page.
+
+- **`version` is shown in the Metadata panel** on the Server, Data Center, Cluster
+  and Network Device tabs. It is the value a caller needs to guard a write
+  (`"version": <n>` in the mutation's variables → `409 MVCC_CONFLICT` on a
+  concurrent edit), and it was the one ConfigItem field the UI never surfaced.
+- **`Server.serialNumber`** is editable in the config editor, shown on the server
+  detail tab, and carried in audit diffs — added to `FormFields` and
+  `BeforeFields` in `internal/configitems/registry.go` and to the `GetServer`
+  query. Without the registry entry the editor silently dropped the key: the save
+  reported success and bumped `version`, but nothing was written. See the two new
+  rows in `docs/planning/debt.md`.
+- **`Server.serialNumber`** (`schema/VERSION` → `v10`). Holds Redfish
+  `ComputerSystem.SerialNumber` verbatim, alongside the existing `serviceTag`.
+  The two are **not** interchangeable: an R450 reports `DLP6K74` for both, while
+  an R650 reports `SKU=CFRHDX3` and `SerialNumber=MXFC400359006Z` — confirmed
+  against live iDRAC 7.20.10.05. Added so consumers can compute serial-number
+  drift per server, which was impossible while orbital stored only the service tag.
+
+  `serviceTag` remains the `orbId` natural key and is unchanged; `serialNumber`
+  is a plain attribute and must never be used for identity. **Requires a DGraph
+  schema alter on deploy** (`deploy/README.md` § 8) — the field is
+  indexed `@search(by: [hash])`, so servers can be looked up by serial.
+
+### Changed
+- **Local DGraph export directories moved from `/tmp/orbital-test-*` to
+  `.local/exports/{blue,scratch,test}`.** **Every developer must recreate their
+  stack once** (`make down && make up`, then `make seed`) — until they do, their
+  containers stay bound to the old paths while orbital reads the new ones, which
+  produces exactly the failure this change removes.
+
+  `/tmp` was the wrong home on two counts. macOS prunes it periodically, and
+  removing an export *directory* under a running container leaves a stale bind
+  mount: the mount was resolved at container start, so the container holds the
+  old inode and the two sides stop agreeing about that path. Re-creating the
+  directory on the host does not repair it — only restarting the container does,
+  which is why `make up`'s `mkdir` could never help. The symptom landed much
+  later as a backup failing with *"no json.gz found after export"*, and it was
+  diagnosed as a product bug more than once. Second, `/tmp` is shared between
+  checkouts: two clones of orbital clobbered each other's exports.
+
+  `.local/` is already gitignored and already the home for local-only files, so
+  ignored artifacts now live in the ignored tree rather than inside tracked
+  `deploy/local/`. Paths are relative in both places but spelled differently —
+  compose resolves against its own directory (`../../.local/exports/blue`), Go
+  against the process working directory (`./.local/exports/blue`).
+
+  Two incidental fixes carried along: the containerized orbital no longer needs a
+  path-identity mount (`/tmp/x:/tmp/x`) now that it sets
+  `DGRAPH_SCRATCH_EXPORT_DIR` explicitly, and the constant `blueExportDir` —
+  which pointed at the *test* alpha's directory, not blue's — is now
+  `testAlphaExportDir`.
+
+- **`docs/auth.md` rewritten for the provider list.** The integrator-facing guide
+  still described Entra: MSAL libraries, tenant GUIDs,
+  `api://<client>/user_impersonation` scopes, an On-Behalf-Of code sample, and
+  `orbctl login` as the primary way to get a token. Every one of those produces a
+  token current orbital rejects, and the CLI's login is broken pending redesign.
+  It now says what an integrator actually needs: that orbital is a resource server
+  which issues nothing, the four things to ask the operator for (issuer, the
+  client id whose `azp` must match, the required audience, the group-to-role
+  mapping), the three caller shapes (client credentials as an app principal,
+  delegated for a backend acting for its own users, PKCE for a human), how a role
+  is derived, and the errors they will actually hit. Provider-neutral throughout —
+  no vendor is named, because the adopter's IdP is theirs. 176 → 120 lines.
+
+- **The sign-in button no longer says "Sign in with Microsoft".** It reads
+  `Sign in with {ORBITAL_OIDC_DISPLAY_NAME}`, default **`SSO`**, with a neutral
+  icon; `static/logo/microsoft.svg` is deleted. The button named a vendor orbital
+  no longer trusts — the deployed IdP is Keycloak — but the fix is not to hardcode
+  the new one: the adopter's IdP is theirs, so an operator sets `Okta`,
+  `Keycloak`, `Entra ID` or whatever their users recognise. Follows ArgoCD's
+  `oidc.config.name` and Grafana's generic-OAuth `name`, both of which default to
+  something provider-neutral. If browser login ever accepts several providers,
+  the same field scales to one button each — the Grafana and GitLab shape.
+
+  An adopter who wants a branded button sets `ORBITAL_OIDC_ICON_URL` to an image
+  **they** host or mount; empty renders a neutral glyph. **Orbital ships no vendor
+  logos on purpose** — "Sign in with Microsoft" and its Google equivalent are
+  specified brand treatments with mandated wording and dimensions, and shipping
+  those marks in an open-source repo hands a trademark obligation to every adopter
+  and fork. The operator has the relationship with their IdP, so they supply the
+  asset and the label. Gitea takes the same approach with its per-source icon.
+
+- **BREAKING — `trustedService` is now `delegatedAuthorization`, `claimValidationRules`
+  is removed, and unrecognised fields fail startup.** Three changes to
+  `ORBITAL_AUTH_PROVIDERS`, which shipped in v0.0.44; each needs a config edit.
+
+  `"trustedService": { "assignedRole": "admin" }` becomes
+  `"delegatedAuthorization": { "role": "admin" }`, with behaviour unchanged. The old
+  name described what the caller *is* while its two siblings describe what orbital
+  *does*, and "trusted" named nothing — every provider in the list is trusted. The
+  new name is RFC 8693 §1.1's: this is delegation rather than impersonation, since
+  both identities survive (the human in the audit actor, the client in
+  `acting_client`), and only *authorization* is delegated — orbital still
+  authenticates the token itself against the issuer's JWKS. The inner key is `role`
+  because the parent already supplies the qualifier, the same reason Kubernetes
+  writes `issuer.url` and RFC 8693 puts `sub` inside `act`.
+
+  **`claimValidationRules` is removed.** It existed to anchor `azp`; `clientID`
+  superseded that job and nothing else ever used it — both its tests still asserted
+  the `azp` case. Use `clientID` for `azp` and `issuer.audiences` for `aud`; a rule
+  on either was redundant at best, and `{"claim": "aud", …}` in particular rejected
+  every Keycloak token, because the comparison is string-only while Keycloak issues
+  `aud` as an array.
+
+  **Unrecognised fields now fail startup.** `encoding/json` drops what it does not
+  know, so without this both changes above would silently disarm a working config
+  instead of refusing it — and `client_id`, the OAuth spelling of `clientID`, would
+  leave an entry matching every client of its issuer. Kubernetes decodes
+  `AuthenticationConfiguration` strictly for the same reason.
+
+  **Roll the config and the image together.** A v0.0.44 orbital reading a
+  `delegatedAuthorization` config ignores the field and then refuses to start
+  (*"set defaultRole, roleMapping or trustedService"*), and this build refuses a
+  `trustedService` config by name.
+
+### Removed
+- **BREAKING — the single-issuer bearer path is gone, and with it
+  `ORBITAL_APP_TOKEN_ALLOWED_APPIDS`.** Bearer verification now exists only
+  through `ORBITAL_AUTH_PROVIDERS`: **a deployment with API auth enabled and no
+  provider list refuses to start** rather than falling back to a second path.
+  `ORBITAL_OIDC_*` is unchanged and still drives the browser login flow — orbital
+  is an OAuth *client* there and a resource server here, and only the second one
+  moved.
+
+  The allowlist existed because the old path trusted exactly one
+  `(issuer, client)` pair, so "which application minted this token" needed a
+  separate global list. A provider list is keyed on `(iss, azp)`, so the entry
+  **is** the allowlist: a client-credentials caller authenticates iff some entry's
+  `clientID` matches its `azp`, and is refused before any role logic otherwise.
+  Its one lasting rule survives in `AUTH.md` — an unset allowlist must never mean
+  "allow everything" — and under the provider list an empty config cannot be
+  permissive, since there is no entry to match. Pinned by
+  `TestProviderSet_AppTokenIsGatedByClientID`, which asserts both the listed and
+  the unlisted case.
+
+  **`deploy/base` no longer names an identity provider at all.** The issuer,
+  client id, token URL and provider list moved to the overlays, because base must
+  not point an adopter's deployment at someone else's IdP. `dev-netbox` carries
+  them for both the orbital container and the in-pod cb-bundler; an overlay
+  without a provider list will not start.
+
+- **BREAKING — `ORBITAL_AUTH_MODE=external-jwt` is gone**, along with
+  `ORBITAL_JWT_ISSUER`, `ORBITAL_JWT_AUDIENCE`, `ORBITAL_JWT_CLIENT_ID` and
+  `ORBITAL_JWT_DEFAULT_ROLE`. `ORBITAL_AUTH_PROVIDERS` supersedes it: a
+  `delegatedAuthorization` entry is the same behaviour (every valid token gets one
+  role, no user row) keyed on `(iss, azp)` rather than globally, so the
+  dual-issuer fallback the mode carried for AAD service and orbctl tokens becomes
+  one more entry in the list. **A deployment still setting these vars will not
+  start** — envconfig ignores a variable with no matching field, so they
+  contribute nothing, and with no provider list the fail-closed guard refuses
+  startup rather than serving unauthenticated. Migration is one provider entry;
+  the shape is in `docs/reference/AUTH.md` § `delegatedAuthorization`.
+
+  One convention the mode owned is recorded in AUTH.md rather than lost: an
+  auth failure never logs an identity decoded from an unverified token.
+  `ProviderSet` logs the issuer, reason and `request.id` only.
+
+  `make run-orbital-aep` is removed with it — it hardcoded an internal Keycloak
+  host and client into a build file. `make run-orbital` sources
+  `deploy/local/orbital.env` (gitignored) when present, and
+  `deploy/local/orbital.env.example` now carries provider-agnostic placeholders
+  plus a commented `ORBITAL_AUTH_PROVIDERS` example of both shapes. It also sets
+  `ORBITAL_API_AUTH_ENABLED=true`, without which `ORBITAL_DEV=true` bypasses
+  bearer verification and a provider list looks broken when it is simply not
+  being consulted.
+
+### Security
+- **State-changing API calls authenticated by session cookie now require an
+  `X-CSRF-Token` header.** A cookie is an ambient credential — the browser
+  attaches it to any request to this origin, including one a third-party page
+  caused — so authentication alone never proved the user intended the call.
+  Until now the entire defence was `SameSite=Lax` on the session cookie: a real
+  control, but one attribute, and setting `SameSite=None` (to embed orbital's UI
+  in another product's frame, say) would have made every mutation forgeable with
+  nothing in the code to notice. **Bearer callers are exempt and must be** — a
+  token is not ambient, and an API client has no session to fetch a token from.
+  Reads are untouched.
+
+  Client-side the header is added by a single `fetch` wrapper in `shared.js`,
+  which `orbital.js` and `orb.js` import, plus an `htmx:configRequest` listener
+  for htmx's own XHRs — rather than at ~25 call sites, so one added later is
+  covered without anyone remembering. Same-origin requests only; the token is
+  never attached to a third-party URL. Verified live: a cookie-authenticated
+  `POST /api/v1/backup` returns **403** without the header and **202** with it,
+  while `GET` is unaffected. Pinned by `TestRequireCSRFOnCookieAuth`, including
+  the bearer exemption and a wrong-token case.
+
+### Changed
+- **`ORBITAL_AUTH_PROVIDERS` is a privilege grant, not just an identity list** —
+  documented, not changed. Any app (client-credentials) caller whose `azp`
+  matches an entry is `dev`-equivalent on every mutating route, so listing a
+  client grants it write access to everything a dev can write. Reviewed
+  2026-09-22 and kept: per-client scoping is cheap to add later (a role on the
+  entry, the shape `delegatedAuthorization.role` already uses) and no second
+  machine caller needs it yet. `AUTH.md` § App callers now states the blast
+  radius instead of leaving it in a code comment.
+
+- **Browser login now uses PKCE, binds the ID token with a `nonce`, and compares
+  `state` in constant time.** OAuth 2.1 makes PKCE mandatory for **all** clients,
+  confidential included — the client secret proves which application is redeeming
+  the code, the verifier proves it is the same party that started the flow.
+  orbctl had been doing this correctly while orbital's own login did not. The
+  `nonce` is what makes a replayed ID token detectable: a token lifted from
+  another login attempt verifies perfectly on signature, issuer, audience and
+  expiry, and nothing else catches it. **An ID token with a missing or mismatched
+  nonce is refused** (`?error=invalid_nonce`), the absent case explicitly, so an
+  implementation that skipped the check when the claim is absent cannot pass.
+  Pinned by `TestOIDCLogin_SendsPKCEChallengeAndNonce`,
+  `TestOIDCCallback_NonceMismatchIsRefused` and
+  `TestOIDCCallback_MissingNonceIsRefused`.
+
+  The three values are stored and cleared as **one** record (`auth.OIDCLogin`) —
+  clearing the state while leaving a verifier or nonce behind is how a stale
+  value gets reused on a later attempt. Round-tripped by
+  `TestOIDCLogin_StateVerifierAndNonceRoundTripTogether`, which asserts all three
+  rather than just the state: a verifier lost in transit turns the exchange into
+  an unexplained 400 at the IdP, and a lost nonce silently disables the replay
+  check.
+
+- **Rate limiting is enabled in `deploy/base`.** `ORBITAL_RATE_LIMIT_ENABLED`
+  defaults to `false` in code, which is right for local dev and wrong for every
+  real deployment: the mechanism existed, attached a tighter bucket to
+  `POST /user/login`, and was never switched on — so the one credential-guessing
+  surface orbital has ran unguarded. Local password login is the break-glass path
+  and cannot be disabled, which is what makes it worth guarding. Verified: at
+  `ORBITAL_LOGIN_RATE_LIMIT_RPS=1` a burst of six attempts returns
+  `200 200 429 429 429 429` with `Retry-After: 1`.
+
+  Per-pod and in-memory, so the ceiling is `RPS x replicas`. It slows one source;
+  it deliberately does **not** lock accounts — lockout on a break-glass path is a
+  denial-of-service anyone can trigger with an admin's email address.
+
+- **The OIDC callback no longer logs claims at INFO on every login.**
+  `oidc.go` logged email, name and `preferred_username` unconditionally, while
+  `AUTH.md` documented claim logging as debug-only and off by default. The
+  `logger.Debug("oidc id token claims", …)` twenty lines below it — the one the
+  docs describe — is unchanged.
+
+### Fixed
+- **A human bearer token could impersonate a service account and gain write
+  access.** Orbital labels machine callers `app:<azp>` in `user_name`, and both
+  `ResolveUser` and `RequireRole` classified callers by prefix-matching that
+  string. For a human, `user_name` is the token's `name` claim — which Keycloak
+  lets the end-user edit in their own account console — so a token whose name
+  began `app:` took the app-principal branch: provisioning skipped, the
+  provider's role never applied, and `RequireRole` granting dev-equivalent
+  access. A readonly user could write.
+
+  The verifier now records the principal kind on the request context
+  (`auth.MarkAppPrincipal` / `auth.IsAppPrincipal`), where no token claim can
+  reach it, and both branches read that. `AppPrincipalPrefix` remains as the
+  display label for audit records, which is all it was ever for. Kubernetes
+  solves this by RESERVING its `system:` prefix, which it must because it is
+  stateless and the username string is the identity; orbital has a context and
+  can carry the fact instead — the same reasoning that rejected `usernamePrefix`
+  for identities.
+
+  Pinned by `TestRequireRole_ForgedAppNameIsNotAnAppPrincipal` (integration —
+  the grant happens at `RequireRole`, which a nil-db unit test short-circuits
+  before reaching) and `TestProviderSet_HumanTokenCannotForgeAnAppPrincipal`,
+  with the real client-credentials path kept as the positive control. Both were
+  run against the previous implementation and fail there.
+
+## [v0.0.44] - 2026-09-20
+
+### Added
+- **Orbital accepts bearer tokens from multiple identity providers.**
+  `ORBITAL_AUTH_PROVIDERS` takes a JSON array of providers, each with its own
+  issuer, audiences, claim validation and role handling. A token selects its
+  provider by the `(iss, azp)` pair, which must be unique, so exactly one provider
+  ever attempts cryptographic validation and there is no "try each until one
+  accepts" fallback. Keying on the pair rather than the issuer alone lets one
+  Keycloak realm host several clients orbital treats differently. A token whose
+  `azp` matches no entry is refused, which makes `clientID` the app-token gate —
+  `ORBITAL_APP_TOKEN_ALLOWED_APPIDS` is ignored when the provider list is set, and
+  orbital warns rather than leaving it silently inoperative. Unset, everything
+  behaves as before; setting it alongside `ORBITAL_AUTH_MODE` is a startup error.
+
+  Each provider says where its callers' roles come from: `defaultRole` (orbital's
+  users table owns roles; a new user is created with it and existing users keep
+  theirs), `roleMapping` (the provider's group claim owns roles, re-derived at
+  every login; no matching group is denied rather than dropped to readonly), or
+  `trustedService` (a caller whose authorization happens upstream: every valid
+  token gets the assigned role and no user row is provisioned). `trustedService`
+  combines with neither of the others and setting none of the three is a startup
+  error; `defaultRole` alongside `roleMapping` is legal and is described below.
+  `trustedService` replaces `ORBITAL_AUTH_MODE=external-jwt` and its
+  `ORBITAL_JWT_DEFAULT_ROLE` — same behaviour, named as the deliberate trust
+  delegation it is rather than a default nobody overrode.
+
+  Orbital keys users by email, so one address cannot be shared across providers —
+  a second provider asserting an existing address is refused rather than
+  inheriting the row.
+
+  `defaultRole` may be set alongside `roleMapping`, where it is the floor for a
+  token whose groups match nothing — without it an unmatched login is refused
+  (Grafana's `role_attribute_strict`). `users.role_source` records whether the
+  provider or an admin last set a role: a matched group always wins, but the floor
+  applies only to users the provider already owned, so an admin's promotion is not
+  reverted at the next login. The users page renders provider-set roles read-only
+  with provenance and leaves locally-set ones editable — Grafana and NetBox
+  overwrite manual changes silently, which is the behaviour their users complain
+  about.
+
+  Role changes driven by a provider write an audit event naming the provider and
+  the causing group — the transition only, not every login. The users page shows
+  provider-owned roles read-only with their provenance, because an editable field
+  that reverts at the next login is worse than one that says who owns it.
+
+  Client-credentials tokens are treated as app principals: no user row, gated by
+  `ORBITAL_APP_TOKEN_ALLOWED_APPIDS` as before. Design and rationale in
+  `docs/reference/AUTH.md` § Multiple identity providers.
+
+  Browser sign-in uses the same mapping as bearer callers, so one identity from
+  one provider cannot end up with two different roles depending on whether it
+  arrived with a cookie or a token. A refused sign-in now shows a reason —
+  `NO_ROLE_MAPPED` or `IDENTITY_INCOMPLETE`, rendered as `error — hint` per
+  `ERROR-RESPONSES.md` — where it previously bounced silently to the home page.
+  `ORBITAL_LOG_LEVEL=debug` logs the decoded ID token claims (never the raw
+  token) for diagnosing a mapping, since the ID token arrives back-channel and
+  is otherwise invisible to an operator.
+
+  Audit events gain `acting_client`, recording the OAuth client that presented
+  the token when it differs from the human in `actor` — so a request made by a
+  trusted upstream service on a user's behalf is distinguishable from that user
+  acting directly. Empty when the caller is their own actor. Inferred from the
+  verified `azp`; RFC 8693's `act` claim supersedes it when token exchange lands.
+
+  `users` gains a nullable `issuer` column recording which provider owns each
+  row. A provider only ever resolves rows it owns — a login for an address owned
+  by a local account or another provider is refused with `IDENTITY_CONFLICT`
+  rather than claiming the row. Without that, any configured provider could mint
+  a token for an existing address and inherit that user's role, including the
+  local break-glass admin. Local password accounts have no issuer, which is what
+  keeps break-glass representable and unclaimable. The one exception is a row with
+  neither an issuer nor a password — unowned and never a local account — which the
+  first provider to resolve it claims, so users predating the column are not
+  locked out of SSO.
+
+- **`ORBITAL_API_AUTH_ENABLED` splits API authentication out of `ORBITAL_DEV`.** `ORBITAL_DEV` bundled
+  three unrelated switches — template hot-reload, the API bearer-auth bypass, and permission to use
+  the placeholder session key — so you could not verify bearers locally without also giving up
+  hot-reload, and the startup log blamed `dev:true` for auth being off. The new variable is
+  hierarchical, not independent: **unset it follows `!ORBITAL_DEV`**, so no existing deployment
+  changes. Set explicitly it wins, making `ORBITAL_DEV=true` + `ORBITAL_API_AUTH_ENABLED=true` a
+  valid combination for the first time. An explicit `false` disables auth in every auth mode;
+  an inherited `false` does not, because `external-jwt` never consulted `ORBITAL_DEV` and quietly
+  dropping auth there would be a regression. Auth resolving to enabled with no usable verifier now
+  **refuses startup** — the fail-closed guard keys on intent rather than on `ORBITAL_DEV`. Both auth
+  log lines carry `decided_by`, so the deciding setting is stated rather than inferred.
+  `ORBITAL_DEV` keeps only what its name implies.
+
+### Changed
+- **BREAKING (deployment) — orbital trusts Keycloak only; Entra is gone from
+  `deploy/base`.** The UI's OIDC client, the bearer providers and cb-bundler's
+  client-credentials grant all point at one Keycloak realm. cb-bundler needed no
+  code change — it already took `ORBITAL_TOKEN_URL` and `ORBITAL_TOKEN_SCOPE`
+  overrides for non-Entra providers; both are now set, and the scope matters
+  because Keycloak rejects Entra's `api://{clientID}/.default` form.
+  **`orbctl login` is broken by this** and is tracked in
+  `docs/planning/backlog.md` — it builds Entra URLs by string concatenation
+  instead of using OIDC discovery.
+
 ### Removed
 - **BREAKING — device-code browser SSO is gone.** `ORBITAL_OAUTH2_DEVICE_CODE` (which defaulted to
   `true`), `GET /auth/device`, `POST /auth/device/poll` and `pages/device-code.gohtml` are all
@@ -38,25 +669,19 @@ what changed. GitHub Release bodies are generated from this file, never the othe
   always had the standard flow available. **orbctl is unaffected** — it uses Authorization Code +
   PKCE with a loopback listener (RFC 8252) and never called these endpoints.
 
-- **`orb scan` is gone from the orb CLI.** It never scanned anything — it slept, printed a
-  hardcoded "Found 3 BMC interfaces" and a fake progress bar, then reported "Scan complete".
-  An operator running it against real hardware would have believed a discovery had happened.
-  The feature remains post-MVP (`docs/reference/ORB.md` § orb scan); only the placeholder
-  command is removed.
+## [v0.0.42] - 2026-09-17
 
 ### Added
-- **`ORBITAL_API_AUTH_ENABLED` splits API authentication out of `ORBITAL_DEV`.** `ORBITAL_DEV` bundled
-  three unrelated switches — template hot-reload, the API bearer-auth bypass, and permission to use
-  the placeholder session key — so you could not verify bearers locally without also giving up
-  hot-reload, and the startup log blamed `dev:true` for auth being off. The new variable is
-  hierarchical, not independent: **unset it follows `!ORBITAL_DEV`**, so no existing deployment
-  changes. Set explicitly it wins, making `ORBITAL_DEV=true` + `ORBITAL_API_AUTH_ENABLED=true` a
-  valid combination for the first time. An explicit `false` disables auth in every auth mode;
-  an inherited `false` does not, because `external-jwt` never consulted `ORBITAL_DEV` and quietly
-  dropping auth there would be a regression. Auth resolving to enabled with no usable verifier now
-  **refuses startup** — the fail-closed guard keys on intent rather than on `ORBITAL_DEV`. Both auth
-  log lines carry `decided_by`, so the deciding setting is stated rather than inferred.
-  `ORBITAL_DEV` keeps only what its name implies.
+- **`DataCenter` gained a `model` field, typed as the `DataCenterModel` enum**
+  (`Beacon`, `Cruiser`, `Triton`, `Leviathan`; `schema/VERSION` → `v9`). An enum
+  rather than a free string, so the set of Galleon models is declared in the schema
+  and reachable by introspection — a client renders a dropdown without orbital
+  publishing a separate list. The field is optional; existing data centers read back
+  `null` until it is set. DGraph enforces the enum at the GraphQL layer only, so a
+  `dgraph live` bulk load can still store an off-list value, which then reads back
+  as `null` **alongside an `errors` entry** rather than failing the query — a client
+  that reads `data` and ignores `errors` cannot tell unset from corrupt. Query,
+  introspection and update examples are in `docs/api-cheatsheet.md`.
 
 - **Orbital now reports when DGraph is running an older schema than the build ships.** It logs a
   `WARN` at startup naming every missing declaration, and the Schema page states whether the applied
@@ -73,8 +698,9 @@ what changed. GitHub Release bodies are generated from this file, never the othe
   from IAM/GitHub-Actions OIDC trust policies after it was found exploitable. The wildcard is now
   explicit: set `*` for the old permissive behaviour. The default is no longer orbital's own app id
   and is now empty, so **a deployment that authenticates any service with client credentials must
-  list its application ids or publish will 401** — `deploy/base/deploy.yaml` sets it for the in-pod
-  cb-bundler. User (non-app) tokens are unaffected.
+  list its application ids or publish will 401** on the legacy single-issuer path. It is inert where
+  `ORBITAL_AUTH_PROVIDERS` is set (each entry's `clientID` is the gate), which is why
+  `deploy/base/deploy.yaml` no longer sets it. User (non-app) tokens are unaffected.
 - **Job tables gained a `status` index** (`export_jobs`, `backups`, `restore_jobs`). Every job
   trigger runs a conflict check filtering `status IN (pending, running)`, which previously scanned
   the whole table. Applied by the boot migration; additive, no data change.
@@ -98,6 +724,13 @@ what changed. GitHub Release bodies are generated from this file, never the othe
   without scanning or rejecting them. Audit an existing graph before applying it and after any bulk
   import; the query is in `docs/reference/DGRAPH.md` § orbId convention. Orbital does not apply the
   DGraph schema at startup, so this reaches a running cluster only when the schema is applied.
+
+### Removed
+- **`orb scan` is gone from the orb CLI.** It never scanned anything — it slept, printed a
+  hardcoded "Found 3 BMC interfaces" and a fake progress bar, then reported "Scan complete".
+  An operator running it against real hardware would have believed a discovery had happened.
+  The feature remains post-MVP (`docs/reference/ORB.md` § orb scan); only the placeholder
+  command is removed.
 
 ## [v0.0.41] - 2026-09-16
 

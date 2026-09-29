@@ -75,6 +75,7 @@ type DataCenter implements ConfigItem {
 }
 
 type Rack implements ConfigItem {
+    uHeight: Int
     dataCenter: DataCenter!
     servers: [Server] @hasInverse(field: rack)
     networkDevices: [NetworkDevice] @hasInverse(field: rack)
@@ -85,7 +86,9 @@ type Server implements ConfigItem {
     model: String @search(by: [term])
     manufacturer: String @search(by: [hash]) 
     serviceTag: String @search(by: [hash])
+    serialNumber: String @search(by: [hash])
     rackPosition: Int
+    uHeight: Float
     oobMAC: String
 
     dataCenter: DataCenter!

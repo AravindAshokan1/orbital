@@ -29,6 +29,10 @@ type User struct {
 	Verified bool `json:"verified,omitempty"`
 	// Role holds the value of the "role" field.
 	Role user.Role `json:"role,omitempty"`
+	// Issuer holds the value of the "issuer" field.
+	Issuer *string `json:"issuer,omitempty"`
+	// RoleSource holds the value of the "role_source" field.
+	RoleSource *user.RoleSource `json:"role_source,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
 	CreatedAt    time.Time `json:"created_at,omitempty"`
 	selectValues sql.SelectValues
@@ -43,7 +47,7 @@ func (*User) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case user.FieldID:
 			values[i] = new(sql.NullInt64)
-		case user.FieldEmail, user.FieldName, user.FieldPreferredUsername, user.FieldPasswordHash, user.FieldRole:
+		case user.FieldEmail, user.FieldName, user.FieldPreferredUsername, user.FieldPasswordHash, user.FieldRole, user.FieldIssuer, user.FieldRoleSource:
 			values[i] = new(sql.NullString)
 		case user.FieldCreatedAt:
 			values[i] = new(sql.NullTime)
@@ -105,6 +109,20 @@ func (_m *User) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.Role = user.Role(value.String)
 			}
+		case user.FieldIssuer:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field issuer", values[i])
+			} else if value.Valid {
+				_m.Issuer = new(string)
+				*_m.Issuer = value.String
+			}
+		case user.FieldRoleSource:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field role_source", values[i])
+			} else if value.Valid {
+				_m.RoleSource = new(user.RoleSource)
+				*_m.RoleSource = user.RoleSource(value.String)
+			}
 		case user.FieldCreatedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
 				return fmt.Errorf("unexpected type %T for field created_at", values[i])
@@ -163,6 +181,16 @@ func (_m *User) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("role=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Role))
+	builder.WriteString(", ")
+	if v := _m.Issuer; v != nil {
+		builder.WriteString("issuer=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.RoleSource; v != nil {
+		builder.WriteString("role_source=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
 	builder.WriteString(", ")
 	builder.WriteString("created_at=")
 	builder.WriteString(_m.CreatedAt.Format(time.ANSIC))

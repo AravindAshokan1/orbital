@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/armada/orbital/internal/web/data/component"
 	"html/template"
 	"io"
 	"log/slog"
@@ -26,7 +27,9 @@ const getServerQuery = `
       model
       manufacturer
       serviceTag
+      serialNumber
       rackPosition
+      uHeight
       oobMAC
       createdBy
       createdAt
@@ -91,7 +94,7 @@ const getServerQuery = `
   }`
 
 type ServerHandler struct {
-	dev       bool
+	hotReload bool
 	dgraphURL string
 	fragment  *template.Template
 	logger    *slog.Logger
@@ -101,10 +104,10 @@ type ServerHandler struct {
 	actions func(echo.Context) layout.PageActions
 }
 
-func NewServerHandler(dgraphURL string, dev bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *ServerHandler {
+func NewServerHandler(dgraphURL string, hotReload bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *ServerHandler {
 	return &ServerHandler{
 		dgraphURL: dgraphURL,
-		dev:       dev,
+		hotReload: hotReload,
 		fragment:  parseServerFragment(),
 		logger:    logger,
 		basePath:  basePath,
@@ -116,26 +119,29 @@ func parseServerFragment() *template.Template {
 	return template.Must(template.ParseFiles(
 		"web/templates/shared/partials/server-tab.gohtml",
 		"web/templates/shared/partials/audit-tab.gohtml",
-		"web/templates/shared/components/edit-modal-server.gohtml",
+		"web/templates/shared/components/metadata-box.gohtml",
+		"web/templates/shared/components/edit-modal.gohtml",
 	))
 }
 
 type serverQueryResponse struct {
-	ID           string `json:"id"`
-	OrbID        string `json:"orbId"`
-	Name         string `json:"name"`
-	Hostname     string `json:"hostname"`
-	Model        string `json:"model"`
-	Manufacturer string `json:"manufacturer"`
-	ServiceTag   string `json:"serviceTag"`
-	RackPosition int    `json:"rackPosition"`
-	OobMAC       string `json:"oobMAC"`
-	CreatedBy    string `json:"createdBy"`
-	CreatedAt    string `json:"createdAt"`
-	UpdatedBy    string `json:"updatedBy"`
-	UpdatedAt    string `json:"updatedAt"`
-	Version      int    `json:"version"`
-	Namespace    string `json:"namespace"`
+	ID           string   `json:"id"`
+	OrbID        string   `json:"orbId"`
+	Name         string   `json:"name"`
+	Hostname     string   `json:"hostname"`
+	Model        string   `json:"model"`
+	Manufacturer string   `json:"manufacturer"`
+	ServiceTag   string   `json:"serviceTag"`
+	SerialNumber string   `json:"serialNumber"`
+	RackPosition int      `json:"rackPosition"`
+	UHeight      *float64 `json:"uHeight"`
+	OobMAC       string   `json:"oobMAC"`
+	CreatedBy    string   `json:"createdBy"`
+	CreatedAt    string   `json:"createdAt"`
+	UpdatedBy    string   `json:"updatedBy"`
+	UpdatedAt    string   `json:"updatedAt"`
+	Version      int      `json:"version"`
+	Namespace    string   `json:"namespace"`
 	Rack         struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -276,7 +282,9 @@ type serverTabDetailData struct {
 	Model           string
 	Manufacturer    string
 	ServiceTag      string
+	SerialNumber    string
 	RackPosition    int
+	UHeight         *float64 // nil renders as em dash — unset is not 0U
 	OobIP           string
 	OobMAC          string
 	CreatedBy       string
@@ -341,6 +349,10 @@ type serverTabDetailData struct {
 	// AuditPanelID matches data-panel on the audit <li> and the id of the
 	// placeholder <div>. Consumed by the shared audit-tab partial.
 	AuditPanelID string
+
+	// EditModal is the shared edit-modal render context (one template for
+	// every parent family) — see component.EditModal.
+	EditModal component.EditModal
 }
 
 // fmtMaintTime renders an ISO-8601 timestamp as a readable UTC string for the
@@ -427,7 +439,9 @@ func (h *ServerHandler) Tab(c echo.Context) error {
 		"model":         raw.Model,
 		"oobMAC":        raw.OobMAC,
 		"rackPosition":  raw.RackPosition,
+		"uHeight":       raw.UHeight,
 		"serviceTag":    raw.ServiceTag,
+		"serialNumber":  raw.SerialNumber,
 		"idracSettings": idracFields,
 	}
 	// serverMaintenance: null when the node is absent — that's what makes the
@@ -493,7 +507,9 @@ func (h *ServerHandler) Tab(c echo.Context) error {
 		Model:        raw.Model,
 		Manufacturer: raw.Manufacturer,
 		ServiceTag:   raw.ServiceTag,
+		SerialNumber: raw.SerialNumber,
 		RackPosition: raw.RackPosition,
+		UHeight:      raw.UHeight,
 		OobIP:        raw.OobIP.Address,
 		OobMAC:       raw.OobMAC,
 		SummaryValuesJSON: rawFieldValues(map[string]any{
@@ -505,7 +521,9 @@ func (h *ServerHandler) Tab(c echo.Context) error {
 			"model":        raw.Model,
 			"oobMAC":       raw.OobMAC,
 			"rackPosition": raw.RackPosition,
+			"uHeight":      raw.UHeight,
 			"serviceTag":   raw.ServiceTag,
+			"serialNumber": raw.SerialNumber,
 		}),
 		CreatedBy:       raw.CreatedBy,
 		CreatedAt:       raw.CreatedAt,
@@ -647,11 +665,30 @@ func (h *ServerHandler) Tab(c echo.Context) error {
 	srv.AuditPanelID = "srv-panel-audit-" + srv.DomID
 
 	tmpl := h.fragment
-	if h.dev {
+	if h.hotReload {
 		tmpl = parseServerFragment()
 	}
 
 	c.Response().Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Server is the only family whose opener reads data-reload-url/-target off
+	// the modal (orbital.js); the others pass a reloadFn instead, so emitting
+	// those attributes for them would be dead markup.
+	reloadURL := "/servers/" + srv.OrbID
+	reloadTarget := "tab-content-srv-" + srv.DomID
+	if srv.ShowDCBack {
+		reloadURL += "?dcCtx=1"
+		reloadTarget = "tab-content-" + srv.DataCenterDomID
+	}
+	srv.EditModal = component.EditModal{
+		Prefix: "srv", Title: "Edit Server",
+		DomID: srv.DomID, OrbID: srv.OrbID, Version: srv.Version,
+		CurrentUser:  srv.CurrentUser,
+		ReloadURL:    reloadURL,
+		ReloadTarget: reloadTarget,
+		IdracOrbID:   srv.IdracOrbID,
+		IdracVersion: srv.IdracVersion,
+		EditDataJSON: srv.EditDataJSON, EditTargetsJSON: srv.EditTargetsJSON,
+	}
 	return renderHTML(c, tmpl, "", srv)
 }
 

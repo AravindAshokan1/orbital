@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/armada/orbital/internal/configitems"
+	"github.com/armada/orbital/internal/web/data/component"
 	"github.com/armada/orbital/internal/web/data/layout"
 	"github.com/labstack/echo/v4"
 )
@@ -33,6 +34,7 @@ const getDataCenterQuery = `
         id
         orbId
         name
+        uHeight
       }
       serversAggregate {
         count
@@ -53,7 +55,7 @@ const getDataCenterQuery = `
   }`
 
 type DataCenter struct {
-	dev       bool
+	hotReload bool
 	dgraphURL string
 	fragment  *template.Template
 	logger    *slog.Logger
@@ -63,10 +65,10 @@ type DataCenter struct {
 	actions func(echo.Context) layout.PageActions
 }
 
-func NewDataCenter(dgraphURL string, dev bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *DataCenter {
+func NewDataCenter(dgraphURL string, hotReload bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *DataCenter {
 	return &DataCenter{
 		dgraphURL: dgraphURL,
-		dev:       dev,
+		hotReload: hotReload,
 		fragment:  parseDataCenterFragment(),
 		logger:    logger,
 		basePath:  basePath,
@@ -78,7 +80,8 @@ func parseDataCenterFragment() *template.Template {
 	return template.Must(template.ParseFiles(
 		"web/templates/shared/partials/datacenter-tab.gohtml",
 		"web/templates/shared/partials/audit-tab.gohtml",
-		"web/templates/shared/components/edit-modal-datacenter.gohtml",
+		"web/templates/shared/components/metadata-box.gohtml",
+		"web/templates/shared/components/edit-modal.gohtml",
 	))
 }
 
@@ -96,9 +99,10 @@ type dcQueryResponse struct {
 	Model       string `json:"model"`
 	Namespace   string `json:"namespace"`
 	Racks       []struct {
-		ID    string `json:"id"`
-		OrbID string `json:"orbId"`
-		Name  string `json:"name"`
+		ID      string `json:"id"`
+		OrbID   string `json:"orbId"`
+		Name    string `json:"name"`
+		UHeight *int   `json:"uHeight"`
 	} `json:"racks"`
 	ServersAggregate struct {
 		Count int `json:"count"`
@@ -139,6 +143,7 @@ type rackTabData struct {
 	ID          string
 	OrbID       string
 	Name        string
+	UHeight     *int // nil renders as em dash — unset is not 0U
 	ServerCount int
 }
 
@@ -169,6 +174,10 @@ type dataCenterTabData struct {
 	// collector (Spike 33), so the panel aggregates their events too.
 	AuditPanelID     string
 	RelatedOrbIDsCSV string
+
+	// EditModal is the shared edit-modal render context (one template for
+	// every parent family) — see component.EditModal.
+	EditModal component.EditModal
 }
 
 func (h *DataCenter) Tab(c echo.Context) error {
@@ -278,6 +287,7 @@ func (h *DataCenter) Tab(c echo.Context) error {
 			ID:          r.ID,
 			OrbID:       r.OrbID,
 			Name:        r.Name,
+			UHeight:     r.UHeight,
 			ServerCount: serversByRack[r.Name],
 		})
 	}
@@ -298,10 +308,16 @@ func (h *DataCenter) Tab(c echo.Context) error {
 	}
 
 	tmpl := h.fragment
-	if h.dev {
+	if h.hotReload {
 		tmpl = parseDataCenterFragment()
 	}
 
 	c.Response().Header().Set("Content-Type", "text/html; charset=utf-8")
+	dc.EditModal = component.EditModal{
+		Prefix: "dc", Title: "Edit Data Center",
+		DomID: dc.DomID, OrbID: dc.OrbID, Version: dc.Version,
+		CurrentUser:  dc.CurrentUser,
+		EditDataJSON: dc.EditDataJSON, EditTargetsJSON: dc.EditTargetsJSON,
+	}
 	return renderHTML(c, tmpl, "", dc)
 }

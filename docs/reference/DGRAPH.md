@@ -2,6 +2,12 @@
 
 Read this before: DGraph schema changes, query/mutation work, export/import, seeding, blue-green operations.
 
+## Settled Decisions
+
+- **A DQL delete does NOT maintain `@hasInverse` — clear the surviving parent's edge yourself.** *(Added 2026-09-23.)* `@hasInverse` is a GraphQL-layer construct: DGraph keeps the two forward predicates in step only for mutations through its **GraphQL** endpoint. Orbital's cascade delete (`bulkDeleteGuarded`) is a **DQL** upsert — deliberately, because that is the only way to get a version-guarded CAS — so an `S * *` delete clears the child and leaves the parent's list edge pointing at an empty uid.
+  ⚠️ **The consequence is not cosmetic.** Any later GraphQL query that walks that edge and selects a non-nullable field fails **entirely**, because DGraph propagates the error to the root: *"Non-nullable field 'orbId' (type String!) was not present in result from Dgraph."* The export subgraph query is exactly that shape, so **one cluster delete permanently broke export for its whole data centre** — while the delete returned `200` with a correct audit event, and the damage surfaced later, in a different subsystem, in an error naming neither the delete nor the node. Eight such corpses accumulated on `colo-galleon`, one per e2e run, unnoticed until someone tried to export.
+  **Rule:** any DQL write that removes a node must also remove the edges held by nodes that **SURVIVE** it, in the same transaction. Only survivors matter — when both ends are deleted the stale edge sits on a tombstone and is unreachable, which is what keeps this to a handful of cases rather than all 28 `@hasInverse` pairs. Today: `DataCenter.kubernetesClusters` (cluster delete); `DataCenter.servers`, `Rack.servers`, `KubernetesNode.server` (server delete); none for a data centre, which is the top of its own subtree. `TestDelete_LeavesNoDanglingParentEdge` reproduces the failure and is verified to fail without the fix. The same obligation applies to **any** new DQL write path, not just deletes.
+
 ## Schema rules
 
 - Schema changes must be **backwards compatible** — orbs may lag orbital by versions. Safe: new types, new nullable fields. Breaking: removing/renaming types or fields, adding non-null fields to existing types.
@@ -16,6 +22,16 @@ Read this before: DGraph schema changes, query/mutation work, export/import, see
   - **⚠️ `v7` adds `@search` to `ConfigItem.version` — an index apply BLOCKS.** DGraph reindexes the predicate across every ConfigItem before `/admin/schema` returns, and mutations wait behind it. Additive and non-destructive, but schedule it like a migration. **Schema before code**; the wrong order fails visibly and harmlessly — a DGraph on `v6` answers `Field "version" is not defined by type ServerFilter` and the mutation is refused unwritten.
   - **⚠️ `v9` adds `DataCenter.model` (`enum DataCenterModel`).** Additive and non-blocking. Chosen over `String` so consumers (AEP) read the valid set by introspection instead of hardcoding it — the first enum in this schema; `NetworkDevice.role` remains a String with a comment. **Adding a model is a schema change + `VERSION` bump + an apply to every DGraph**, unlike a String where a new value is just data.
 
+**`Server.uHeight` is how many units a server OCCUPIES; `Rack.uHeight` is how
+many the rack HAS.** Both nullable — `0` means a rack-mounted device consuming no
+unit, which is not "unset". Server height is a MODEL-level fact stored per
+instance; promote it to a model entity when a SECOND such fact appears (depth,
+power draw, weight), not before.
+
+Values were harvested from NetBox before its decommission; two of thirteen
+models resolved only by joining on serviceTag or interface MAC, not by model
+string, so the mapping is not reconstructible from orbital alone.
+
 ## ConfigItem interface
 
 - `Namespace` is a pure tenancy boundary — no config fields, never implements `ConfigItem`. Exists solely as an isolation scope for graph partitioning and orphan detection.
@@ -29,15 +45,15 @@ Read this before: DGraph schema changes, query/mutation work, export/import, see
 
 | Type | `orbId` | Natural key |
 |---|---|---|
-| `Server` | `<ns>:server-<serial>` | **Redfish System SerialNumber** — Dell Service Tag (`BFRHDX3`) and Supermicro (`S447008X3823034`) are both just this; it's also the `<serverTag>` in the network-* ids below. **Never `asset_tag`** — that's org-assigned and can be null (was null for the A100), which breaks scan-idempotency. |
-| `ServerMaintenance` | `<ns>:server-maintenance-<serial>` | owner server serial — 1:1 with `Server`, so the natural key is just the owner serial (same value as `server-<serial>`). No discriminator: one maintenance node per server (intent, not history — history lives in the audit log + edge Events). |
+| `Server` | `<ns>:server-<serviceTag>` | **The vendor's stable chassis identifier**, stored on `Server.serviceTag`. **Dell:** Redfish `ComputerSystem.SKU` — the Service Tag (`CFRHDX3`). **Supermicro:** Redfish `ComputerSystem.SerialNumber` (`S447008X3823034`), because Supermicro leaves SKU unset *(vendor behaviour — not verified against a live BMC; the Dell half was)*. **NOT Dell's `SerialNumber`** — on 15G that is a different value (R650: SKU `CFRHDX3` vs SerialNumber `MXFC400359006Z`, verified on iDRAC 7.20.10.05); on earlier generations the two coincide (R450: `DLP6K74` for both), which is what made the old "SerialNumber" wording look correct. `Server.serialNumber` holds the raw SerialNumber and is **never** an identity key. This same value is the `<serviceTag>` in the network-* ids below. **Never Redfish `AssetTag`** — org-assigned and often empty (`""` on the R650, null for the A100), which breaks scan-idempotency. |
+| `ServerMaintenance` | `<ns>:server-maintenance-<serviceTag>` | owner server `serviceTag` — 1:1 with `Server`, so the natural key is just the owner's serviceTag (same value as `server-<serviceTag>`). No discriminator: one maintenance node per server (intent, not history — history lives in the audit log + edge Events). |
 | `NetworkDevice` | `<ns>:network-device-<serial>` | switch/firewall serial |
-| `NetworkAdapter` | `<ns>:network-adapter-<serverTag>-<FQDD>` | owner serial + Redfish adapter FQDD |
-| `NetworkInterface` (server NIC) | `<ns>:network-interface-<serverTag>-<FQDD>` | owner serial + Redfish interface FQDD |
-| `NetworkInterface` (BMC) | `<ns>:network-interface-<serverTag>-<mgmt>` | owner serial + Redfish Manager name: `iDRAC` (Dell) / `IPMI` (Supermicro) |
+| `NetworkAdapter` | `<ns>:network-adapter-<serviceTag>-<FQDD>` | owner serviceTag + Redfish adapter FQDD |
+| `NetworkInterface` (server NIC) | `<ns>:network-interface-<serviceTag>-<FQDD>` | owner serviceTag + Redfish interface FQDD |
+| `NetworkInterface` (BMC) | `<ns>:network-interface-<serviceTag>-<mgmt>` | owner serviceTag + Redfish Manager name: `iDRAC` (Dell) / `IPMI` (Supermicro) |
 | `NetworkInterface` (device port) | `<ns>:network-interface-<deviceSerial>-<port>` | device serial + port (`ge-0/0/0`) |
 
-**Legacy (pre-convention — migrate when next touched, don't treat network types as the special case):** `IPAddress` = `<ns>:<address>`, `Rack` = `<ns>:<rackName>`, `IdracSettings` = `<ns>:<serviceTag>-idrac`, cluster children = `<ns>:<clusterName>-<kind>`. (`Server` migrated to `server-<serial>` 2026-08-12.)
+**Legacy (pre-convention — migrate when next touched, don't treat network types as the special case):** `IPAddress` = `<ns>:<address>`, `Rack` = `<ns>:<rackName>`, `IdracSettings` = `<ns>:<serviceTag>-idrac`, cluster children = `<ns>:<clusterName>-<kind>`. (`Server` migrated to `server-<serviceTag>` 2026-08-12.)
 
 **The audit — run it before applying the constraint to any graph, and after a bulk import:**
 

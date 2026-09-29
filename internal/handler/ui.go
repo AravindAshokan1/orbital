@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -29,34 +30,37 @@ import (
 )
 
 type UI struct {
-	dev             bool
-	ratelURL        string
-	issueTrackerURL string
-	oidcEnabled     bool
-	backupEnabled   bool
-	backupCronSpec  string
-	s3Endpoint      string
-	s3Bucket        string
-	ociConfigured   bool
-	ociRegistry     string
-	ociRepo         string
-	exportDir       string
-	schemaPath      string
-	dgraphURL       string
-	dgraphAdminURL  string
-	version         string
-	basePath        string
-	db              *ent.Client
-	logger          *slog.Logger
-	templates       map[string]*template.Template
+	hotReload         bool
+	ratelURL          string
+	issueTrackerURL   string
+	oidcEnabled       bool
+	oidcDisplayName   string
+	oidcIconURL       string
+	backupEnabled     bool
+	backupCronSpec    string
+	s3Endpoint        string
+	s3Bucket          string
+	ociConfigured     bool
+	ociRegistry       string
+	ociRepo           string
+	exportDir         string
+	schemaPath        string
+	roleOwningIssuers map[string]struct{}
+	dgraphURL         string
+	dgraphAdminURL    string
+	version           string
+	basePath          string
+	db                *ent.Client
+	logger            *slog.Logger
+	templates         map[string]*template.Template
 }
 
-func NewUI(dev bool, ratelURL, issueTrackerURL string, oidcEnabled, backupEnabled bool, s3Endpoint, s3Bucket string, basePath string, db *ent.Client, logger *slog.Logger) *UI {
+func NewUI(hotReload bool, ratelURL, issueTrackerURL string, oidcEnabled, backupEnabled bool, s3Endpoint, s3Bucket string, basePath string, db *ent.Client, logger *slog.Logger) *UI {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &UI{
-		dev:             dev,
+		hotReload:       hotReload,
 		ratelURL:        ratelURL,
 		issueTrackerURL: issueTrackerURL,
 		oidcEnabled:     oidcEnabled,
@@ -69,6 +73,18 @@ func NewUI(dev bool, ratelURL, issueTrackerURL string, oidcEnabled, backupEnable
 		version:         fmt.Sprintf("%d", time.Now().Unix()),
 		templates:       webtemplates.Map(),
 	}
+}
+
+// SetOIDCBranding sets how the sign-in button names and illustrates the
+// configured identity provider. Both are operator-supplied: orbital ships no
+// vendor logos and hardcodes no provider name, because the adopter's IdP is
+// theirs. An empty icon URL renders a neutral glyph.
+//
+// A setter rather than two more constructor arguments — NewUI already takes ten,
+// and this follows the six Set* methods below.
+func (h *UI) SetOIDCBranding(displayName, iconURL string) {
+	h.oidcDisplayName = displayName
+	h.oidcIconURL = iconURL
 }
 
 // SetOCIConfig passes OCI config to the UI handler for rendering state-aware pages.
@@ -86,6 +102,19 @@ func (h *UI) SetSchemaPath(path string) {
 	h.schemaPath = path
 }
 
+// SetRoleOwningIssuers records the issuer URL of every provider whose roles come
+// from group claims (mode B). A user last resolved by one of these has a
+// provider-owned role, so the users page shows it read-only rather than offering
+// an edit the next login would discard.
+//
+// Keyed on the stored issuer, which is the recorded fact. An earlier version
+// inferred this from the email's prefix and broke immediately: a deployment with
+// one provider has no prefix, so a provider-owned user rendered editable and the
+// next login would have silently discarded the edit.
+func (h *UI) SetRoleOwningIssuers(issuers map[string]struct{}) {
+	h.roleOwningIssuers = issuers
+}
+
 func (h *UI) SetDGraphURL(url string) {
 	h.dgraphURL = url
 }
@@ -100,7 +129,7 @@ func (h *UI) SetBackupCronSpec(spec string) {
 
 func (h *UI) render(c echo.Context, name string, data any) error {
 	tmpl, ok := h.templates[name]
-	if h.dev {
+	if h.hotReload {
 		tmpl, ok = webtemplates.Map()[name]
 	}
 	if !ok {
@@ -115,7 +144,7 @@ func (h *UI) render(c echo.Context, name string, data any) error {
 // of the page back, not the full layout.
 func (h *UI) renderFragment(c echo.Context, page, fragment string, data any) error {
 	tmpl, ok := h.templates[page]
-	if h.dev {
+	if h.hotReload {
 		tmpl, ok = webtemplates.Map()[page]
 	}
 	if !ok {
@@ -169,8 +198,34 @@ func (h *UI) base(c echo.Context) layout.Base {
 	userEmail, _ := c.Get("user_email").(string)
 	csrfToken, _ := c.Get("csrf_token").(string)
 	version := h.version
-	if h.dev {
+	if h.hotReload {
 		version = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+
+	// Surface a refused sign-in. The redirect carries a registry code, never
+	// prose, so nothing from the provider is echoed into the page. Rendered as
+	// "error — hint", the same shape apiErrorFromBody produces for API errors
+	// (ERROR-RESPONSES.md; UI.md § the client half of the contract).
+	var loginError, loginErrorCode string
+	switch code := c.QueryParam("error"); code {
+	case CodeNoRoleMapped:
+		loginErrorCode = code
+		loginError = "No group in your token maps to a role in orbital. Ask an administrator to assign you a mapped group in your identity provider."
+	case CodeIdentityConflict:
+		loginErrorCode = code
+		loginError = "Sign-in refused: that email already belongs to a different account in orbital. — A local account or another identity provider owns it. Orbital identifies users by email today, so one address cannot be shared across providers."
+	case CodeIdentityIncomplete:
+		loginErrorCode = code
+		loginError = "Identity provider did not supply an email address. Orbital identifies users by email Ask an administrator to add one to your account."
+	case CodeInvalidState:
+		loginErrorCode = code
+		loginError = "Sign-in could not be completed. — The login attempt did not match the one this browser started, which usually means it was resumed from a stale tab or took too long. Try again."
+	case CodeInvalidNonce:
+		loginErrorCode = code
+		loginError = "Sign-in refused: the identity provider's response did not match this login attempt. — Try again; if it persists, the provider may not be returning the `nonce` orbital sent."
+	case CodeNoIDToken:
+		loginErrorCode = code
+		loginError = "Identity provider returned no ID token. — Orbital reads identity from the ID token, so the provider must include `openid` in the granted scopes."
 	}
 
 	var userRole string
@@ -197,6 +252,10 @@ func (h *UI) base(c echo.Context) layout.Base {
 		NavBar:             layout.NavBar{RatelURL: h.ratelURL, IssueTrackerURL: h.issueTrackerURL},
 		IsAuthn:            isAuthn,
 		OIDCEnabled:        h.oidcEnabled,
+		OIDCDisplayName:    oidcDisplayName(h.oidcDisplayName),
+		OIDCIconURL:        h.oidcIconURL,
+		LoginError:         loginError,
+		LoginErrorCode:     loginErrorCode,
 		User:               layout.User{Id: userID, Name: userName, Email: userEmail, Role: userRole},
 		CanMutate:          canMutate,
 		AdminEmails:        adminEmails,
@@ -426,7 +485,7 @@ func (h *UI) DivergenceReports(c echo.Context) error {
 				FirstSeenAt:   e.FirstSeenAt.UTC().Format("2006-01-02 15:04 UTC"),
 				LastSeenAt:    e.LastSeenAt.UTC().Format("2006-01-02 15:04 UTC"),
 			}
-			// Per ADR 012: resolutions in the table are the operator's current
+			// Per DIVERGENCE.md: resolutions in the table are the operator's current
 			// decision by construction. The ingester wipes them when orb
 			// publishes a content-differing report, so anything still here
 			// applies to the current snapshot.
@@ -654,7 +713,7 @@ func (h *UI) Restore(c echo.Context) error {
 // Schema renders the GraphQL schema currently active in DGraph — the honest
 // source of truth, not the on-disk file. Version is still read from the
 // sibling schema/VERSION file because that label is human-set (bumped manually
-// per ADR 007) and isn't stored in DGraph; the file is the right home for it.
+// per DGRAPH.md § schema version) and isn't stored in DGraph; the file is the right home for it.
 // SDL comes from DGraph's `getGQLSchema` admin query, so a fresh / wiped
 // DGraph renders an "Awaiting import" state instead of lying about a schema
 // the file claims is loaded.
@@ -695,13 +754,25 @@ func (h *UI) Users(c echo.Context) error {
 		}
 		rows = make([]page.UserRow, len(users))
 		for i, u := range users {
-			rows[i] = page.UserRow{
+			row := page.UserRow{
 				ID:        u.ID,
 				Email:     u.Email,
 				Name:      u.Name,
 				Role:      string(u.Role),
 				CreatedAt: u.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 			}
+			// Provider-owned only when the PROVIDER set this role. A user the
+			// admin promoted (role_source=local) stays editable, because their
+			// edit will survive the next login — rendering it read-only would
+			// state the opposite of what happens.
+			if u.Issuer != nil && u.RoleSource != nil && *u.RoleSource == user.RoleSourceProvider {
+				if _, owns := h.roleOwningIssuers[*u.Issuer]; owns {
+					row.ProviderOwned = true
+					row.RoleSource = *u.Issuer
+					row.RoleSourceLabel = issuerLabel(*u.Issuer)
+				}
+			}
+			rows[i] = row
 		}
 	}
 	return h.render(c, "users", page.Users{
@@ -730,4 +801,25 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm", minutes)
 	}
 	return d.String()
+}
+
+// oidcDisplayName falls back to a provider-neutral label. Empty is what a
+// caller that never configured one passes, and a blank button is worse than a
+// generic one.
+func oidcDisplayName(name string) string {
+	if name == "" {
+		return "SSO"
+	}
+	return name
+}
+
+// issuerLabel shortens an issuer URL to its host for inline display. The full
+// URL stays in the tooltip: two realms on one host are distinguishable there,
+// while an unparseable value falls back to itself rather than rendering blank.
+func issuerLabel(issuer string) string {
+	u, err := url.Parse(issuer)
+	if err != nil || u.Host == "" {
+		return issuer
+	}
+	return u.Host
 }

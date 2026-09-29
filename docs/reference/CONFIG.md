@@ -37,7 +37,7 @@ Borrowed from Kubernetes' feature-gate policy — Alpha off by default, Beta on,
 | `ORBITAL_CHANGE_CONTROL_ENABLED` | **Ops** | `true` | Removes the change-control feature entirely: the Change Requests queue, the Approval Policies page, their REST endpoints (**404**, not 403 — the routes are never registered) and the nav section. No mutation is gated. With it off the approval gate never runs either, whatever policies remain in the database. **Deletes nothing**: change requests, approvals and policies stay in PostgreSQL and reappear if it is switched back on. Earns a toggle because the feature is *actively harmful* to an adopter running their own change management — two systems answering "was this approved", with orbital's flow invisible to their org's audit. |
 | `ORBITAL_INLINE_SELECTOR_REJECT` | **Ops** | `true` | Stops rejecting single-entity `update{Kind}` mutations that inline their `orbId`/`set` instead of passing variables. Those writes then proceed **unstamped** — no `version` bump, no `updatedAt`/`updatedBy`. See [`ERROR-RESPONSES.md`](./ERROR-RESPONSES.md). |
 | `ORBITAL_DIVERGENCE_INGEST_ENABLED` | **Ops** | `true` | Stops the S3 poller ingesting divergence reports. Existing entries stay; nothing new arrives. |
-| `ORBITAL_API_AUTH_ENABLED` | **Ops** | *(unset)* | Decides whether bearer verification is installed on `/api/v1` and `/graphql`. **Unset it follows `!ORBITAL_DEV`** — the historical coupling, so nothing changes for an existing deployment. Set explicitly, it wins in every auth mode, which is the point: `ORBITAL_DEV=true` + this `=true` gives API auth **and** template hot-reload, a combination `ORBITAL_DEV` alone cannot express. Explicit `false` switches auth off even in `external-jwt` mode; inherited false does not, because that mode never consulted `ORBITAL_DEV` and silently dropping auth there would be a regression. If auth resolves to enabled but no verifier can be built, orbital **refuses to start**. |
+| `ORBITAL_API_AUTH_ENABLED` | **Ops** | `true` | Decides whether bearer verification is installed on `/api/v1` and `/graphql`. **Defaults ON** and inherits from nothing (2026-09-23) — it previously followed `!ORBITAL_DEV`, which defaulted to `true`, so an operator who configured nothing got **no API auth** and `server.go`'s fail-closed guard could not catch it (that guard only fires when auth is *required*). Explicit `false` switches auth off in every auth mode, and is now the only way to get there. If auth resolves to enabled but no verifier can be built, orbital **refuses to start**. |
 
 There are currently **no maturity toggles**. Adding one requires naming its removal trigger in this table.
 
@@ -51,8 +51,7 @@ Generated from `internal/config/config.go` — the struct tags are the source of
 |---|---|
 | `ORBITAL_ADMIN_EMAILS` | `admin@armada.ai` |
 | `ORBITAL_API_AUTH_ENABLED` | — |
-| `ORBITAL_APP_TOKEN_ALLOWED_APPIDS` | `5fc832f6-843e-4207-93dd-b3c3a77c06f2` |
-| `ORBITAL_AUTH_MODE` | — |
+| `ORBITAL_AUTH_PROVIDERS` | — |
 | `ORBITAL_BACKUP_RETENTION_DAYS` | `14` |
 | `ORBITAL_BACKUP_RETENTION_MIN_COUNT` | `3` |
 | `ORBITAL_BACKUP_SCHEDULE` | — |
@@ -64,7 +63,7 @@ Generated from `internal/config/config.go` — the struct tags are the source of
 | `ORBITAL_BUNDLER_URLS` | `configbundle-bundler=http://localhost:8020/bundle` |
 | `ORBITAL_CHANGE_CONTROL_ENABLED` | `true` |
 | `ORBITAL_COOKIE_SECURE` | `false` |
-| `ORBITAL_DEV` | `true` |
+| `ORBITAL_TEMPLATE_HOT_RELOAD_ENABLED` | `false` |
 | `ORBITAL_DGRAPH_ALPHA_GRPC` | `localhost:9080` |
 | `ORBITAL_DGRAPH_ZERO_GRPC` | `localhost:5080` |
 | `ORBITAL_DIVERGENCE_INGEST_ENABLED` | `true` |
@@ -76,10 +75,6 @@ Generated from `internal/config/config.go` — the struct tags are the source of
 | `ORBITAL_JOB_HEARTBEAT_INTERVAL` | `10s` |
 | `ORBITAL_JOB_ORPHAN_GRACE` | `1h` |
 | `ORBITAL_JOB_STALE_AFTER` | `60s` |
-| `ORBITAL_JWT_AUDIENCE` | — |
-| `ORBITAL_JWT_CLIENT_ID` | — |
-| `ORBITAL_JWT_DEFAULT_ROLE` | `readonly` |
-| `ORBITAL_JWT_ISSUER` | — |
 | `ORBITAL_LOGIN_RATE_LIMIT_RPS` | `5` |
 | `ORBITAL_LOG_LEVEL` | `info` |
 | `ORBITAL_MAX_REQUEST_BODY` | `10M` |
@@ -91,9 +86,11 @@ Generated from `internal/config/config.go` — the struct tags are the source of
 | `ORBITAL_OCI_REPO` | `orbital` |
 | `ORBITAL_OCI_SIGNING_KEY_PATH` | `deploy/local/cosign.key` |
 | `ORBITAL_OCI_USERNAME` | — |
-| `ORBITAL_OIDC_CLIENT_ID` | `5fc832f6-843e-4207-93dd-b3c3a77c06f2` |
+| `ORBITAL_OIDC_DISPLAY_NAME` | `SSO` |
+| `ORBITAL_OIDC_ICON_URL` | — |
+| `ORBITAL_OIDC_CLIENT_ID` | — |
 | `ORBITAL_OIDC_CLIENT_SECRET` | — |
-| `ORBITAL_OIDC_ISSUER_URL` | `https://login.microsoftonline.com/8f231c2a-9551-4b40-be17-5b24afe5e890/v2.0` |
+| `ORBITAL_OIDC_ISSUER_URL` | — |
 | `ORBITAL_OIDC_REDIRECT_URL` | `http://localhost:8001/auth/callback` |
 | `ORBITAL_PORT` | `8001` |
 | `ORBITAL_RATE_LIMIT_ENABLED` | `false` |
@@ -106,6 +103,78 @@ Generated from `internal/config/config.go` — the struct tags are the source of
 
 ---
 
+## `ORBITAL_AUTH_PROVIDERS`
+
+A JSON array of identity providers orbital accepts bearer tokens from. It is the
+only source of bearer verification — unset, there is none, and a deployment with
+API auth enabled refuses to start rather than serve unauthenticated.
+`ORBITAL_OIDC_*` configures the browser login flow, which is a different job.
+
+To run orbital against your own provider locally, copy
+`deploy/local/orbital.env.example` to `deploy/local/orbital.env` — `make
+run-orbital` sources it when present. It carries a commented example of both
+provider shapes, and sets `ORBITAL_API_AUTH_ENABLED=true`, without which
+`ORBITAL_API_AUTH_ENABLED=false` bypasses bearer verification entirely. (Until 2026-09-23 this was a side effect of `ORBITAL_DEV=true`, the default — see the settled decision below.)
+
+```json
+[
+  { "issuer": { "url": "https://keycloak.example.com/realms/aep", "audiences": ["armada-orbital"] },
+    "clientID": "aep-fleet-commander",
+    "claimMappings": { "username": { "claim": "email" } },
+    "delegatedAuthorization": { "role": "admin" } },
+  { "issuer": { "url": "https://keycloak.example.com/realms/aep", "audiences": ["armada-orbital", "account"] },
+    "clientID": "armada-orbital",
+    "claimMappings": { "username": { "claim": "email" }, "groups": { "claim": "orbital_roles" } },
+    "roleMapping": [ { "group": "orbital-admin", "role": "admin" } ],
+    "defaultRole": "readonly" }
+]
+```
+
+In a manifest this is a block scalar, which reviews fine in a diff:
+
+```yaml
+- name: ORBITAL_AUTH_PROVIDERS
+  value: |
+    [ … ]
+```
+
+### Fields
+
+| Key | Type | Required | Effect |
+|---|---|---|---|
+| `issuer.url` | string | yes | The `iss` this entry matches. **https only**, and `(url, clientID)` must be unique across entries so a token selects exactly one provider. |
+| `issuer.audiences` | []string | yes | Accepted `aud` values; the token must carry **any one**. Handles `aud` as a string or an array. |
+| `issuer.certificateAuthority` | string (PEM path) | no | Trust roots for reaching an IdP behind a private CA. Empty uses the system store. |
+| `clientID` | string | no | The `azp` this entry matches. Empty = issuer-wide default; a specific entry always wins. A token whose `azp` matches no entry is refused, which makes this the app-token allowlist. |
+| `claimMappings.username.claim` | string | yes | Which claim carries identity. Written to the audit actor, and to `users.email` where a row is provisioned. |
+| `claimMappings.groups.claim` | string | with `roleMapping` | Which claim carries membership. |
+| `defaultRole` | `readonly`/`dev`/`admin` | one of the three role settings | See the table below. |
+| `roleMapping[].group`, `.role` | string, role | one of the three | Maps one group value to one orbital role. Most privileged match wins. |
+| `delegatedAuthorization.role` | `readonly`/`dev`/`admin` | one of the three | See the table below. |
+
+**Unrecognised fields fail startup**, rather than being silently ignored — a
+dropped field in an auth config is a constraint the operator wrote that never
+applies. This is why `trustedService` (renamed to `delegatedAuthorization`) and
+`claimValidationRules` (removed — `clientID` pins `azp`, `issuer.audiences` pins
+`aud`) refuse to boot instead of doing nothing.
+
+### Where the role comes from
+
+Exactly one of these three must be set, and only the first two combine:
+
+| | Who owns the role | User row | Combines with |
+|---|---|---|---|
+| `defaultRole` | orbital's users table — this is what a NEW user is created with, and an admin edit sticks | created | `roleMapping` |
+| `roleMapping` | the provider's groups, re-derived at every login; no match = 401 | created | `defaultRole` |
+| `delegatedAuthorization` | an upstream service that authorized its own users; every valid token gets this role | **never created** | nothing |
+
+Set together, `roleMapping` decides and `defaultRole` is the **floor** for a token
+matching no group — without it an unmatched login is refused. A provider setting
+none of the three is a startup error.
+
+Applying a change needs a restart. See [AUTH.md](AUTH.md) § Multiple identity
+providers for why, and for the full model.
+
 ## Multi-replica notes
 
 Orbital runs safely at any replica count (see [`deploy/README.md`](../../deploy/README.md) § High availability). Two settings behave **per pod**, not per cluster:
@@ -114,3 +183,10 @@ Orbital runs safely at any replica count (see [`deploy/README.md`](../../deploy/
 - **Connection pool** (`DefaultMaxConns`, 10, not env-configurable) — total load on PostgreSQL is `10 x replicas`; keep it under the server's `max_connections`.
 
 The three `ORBITAL_JOB_*` durations govern job liveness. **`STALE_AFTER` does not need to exceed job duration** — a running job refreshes its heartbeat, so it is provably alive throughout. `ORPHAN_GRACE` applies only to jobs with no heartbeat at all and must stay far longer, because a rolling update can leave one still executing in the outgoing pod. Rationale and precedents: [`OCI.md`](OCI.md) § Job leases.
+
+## Settled Decisions
+
+- **`ORBITAL_DEV` was split into per-capability flags and REMOVED.** *(2026-09-23.)* One boolean, named after an audience, decided three unrelated things: template hot-reload, whether bearer auth was installed, and whether the placeholder session HMAC key was accepted. A developer who wanted hot-reload also got auth off, and nothing in the name said so. It defaulted to `true`, so the coupling was **fail-open**: configure nothing, get no API auth.
+  Replaced by: **`ORBITAL_TEMPLATE_HOT_RELOAD_ENABLED`** (default `false` — pure convenience), **`ORBITAL_API_AUTH_ENABLED`** (default `true` — fail-safe, inherits from nothing), and an **unconditional** refusal of the published placeholder session key, with an ephemeral key generated when `ORBITAL_SESSION_HMAC_KEY` is unset so a fresh clone still runs. `ORBITAL_COOKIE_SECURE` was already independent.
+  **Developer posture now lives in the Makefile, not in the binary's defaults** — `make run-orbital` opts into hot-reload, opts out of API auth, and writes a persistent `deploy/local/session-hmac.key` (gitignored) so sessions survive restarts. That is the general rule: *a convenience default belongs in the dev tooling; the binary defaults to the safe value.* Do NOT reintroduce a mode flag that sets security posture as a side effect. Pinned by `TestAPIAuthResolution`, `TestTemplateHotReload_DefaultsOff` and `TestPlaceholderSessionKeyIsRefusedUnconditionally`.
+  orb's `ORB_DEV` → `ORB_TEMPLATE_HOT_RELOAD_ENABLED` in the same pass; it only ever controlled hot-reload, and the two apps should name the same behaviour the same way.

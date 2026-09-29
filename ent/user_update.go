@@ -117,6 +117,46 @@ func (_u *UserUpdate) SetNillableRole(v *user.Role) *UserUpdate {
 	return _u
 }
 
+// SetIssuer sets the "issuer" field.
+func (_u *UserUpdate) SetIssuer(v string) *UserUpdate {
+	_u.mutation.SetIssuer(v)
+	return _u
+}
+
+// SetNillableIssuer sets the "issuer" field if the given value is not nil.
+func (_u *UserUpdate) SetNillableIssuer(v *string) *UserUpdate {
+	if v != nil {
+		_u.SetIssuer(*v)
+	}
+	return _u
+}
+
+// ClearIssuer clears the value of the "issuer" field.
+func (_u *UserUpdate) ClearIssuer() *UserUpdate {
+	_u.mutation.ClearIssuer()
+	return _u
+}
+
+// SetRoleSource sets the "role_source" field.
+func (_u *UserUpdate) SetRoleSource(v user.RoleSource) *UserUpdate {
+	_u.mutation.SetRoleSource(v)
+	return _u
+}
+
+// SetNillableRoleSource sets the "role_source" field if the given value is not nil.
+func (_u *UserUpdate) SetNillableRoleSource(v *user.RoleSource) *UserUpdate {
+	if v != nil {
+		_u.SetRoleSource(*v)
+	}
+	return _u
+}
+
+// ClearRoleSource clears the value of the "role_source" field.
+func (_u *UserUpdate) ClearRoleSource() *UserUpdate {
+	_u.mutation.ClearRoleSource()
+	return _u
+}
+
 // Mutation returns the UserMutation object of the builder.
 func (_u *UserUpdate) Mutation() *UserMutation {
 	return _u.mutation
@@ -171,6 +211,11 @@ func (_u *UserUpdate) check() error {
 			return &ValidationError{Name: "role", err: fmt.Errorf(`ent: validator failed for field "User.role": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.RoleSource(); ok {
+		if err := user.RoleSourceValidator(v); err != nil {
+			return &ValidationError{Name: "role_source", err: fmt.Errorf(`ent: validator failed for field "User.role_source": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -206,6 +251,18 @@ func (_u *UserUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.Role(); ok {
 		_spec.SetField(user.FieldRole, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.Issuer(); ok {
+		_spec.SetField(user.FieldIssuer, field.TypeString, value)
+	}
+	if _u.mutation.IssuerCleared() {
+		_spec.ClearField(user.FieldIssuer, field.TypeString)
+	}
+	if value, ok := _u.mutation.RoleSource(); ok {
+		_spec.SetField(user.FieldRoleSource, field.TypeEnum, value)
+	}
+	if _u.mutation.RoleSourceCleared() {
+		_spec.ClearField(user.FieldRoleSource, field.TypeEnum)
 	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
@@ -317,6 +374,46 @@ func (_u *UserUpdateOne) SetNillableRole(v *user.Role) *UserUpdateOne {
 	return _u
 }
 
+// SetIssuer sets the "issuer" field.
+func (_u *UserUpdateOne) SetIssuer(v string) *UserUpdateOne {
+	_u.mutation.SetIssuer(v)
+	return _u
+}
+
+// SetNillableIssuer sets the "issuer" field if the given value is not nil.
+func (_u *UserUpdateOne) SetNillableIssuer(v *string) *UserUpdateOne {
+	if v != nil {
+		_u.SetIssuer(*v)
+	}
+	return _u
+}
+
+// ClearIssuer clears the value of the "issuer" field.
+func (_u *UserUpdateOne) ClearIssuer() *UserUpdateOne {
+	_u.mutation.ClearIssuer()
+	return _u
+}
+
+// SetRoleSource sets the "role_source" field.
+func (_u *UserUpdateOne) SetRoleSource(v user.RoleSource) *UserUpdateOne {
+	_u.mutation.SetRoleSource(v)
+	return _u
+}
+
+// SetNillableRoleSource sets the "role_source" field if the given value is not nil.
+func (_u *UserUpdateOne) SetNillableRoleSource(v *user.RoleSource) *UserUpdateOne {
+	if v != nil {
+		_u.SetRoleSource(*v)
+	}
+	return _u
+}
+
+// ClearRoleSource clears the value of the "role_source" field.
+func (_u *UserUpdateOne) ClearRoleSource() *UserUpdateOne {
+	_u.mutation.ClearRoleSource()
+	return _u
+}
+
 // Mutation returns the UserMutation object of the builder.
 func (_u *UserUpdateOne) Mutation() *UserMutation {
 	return _u.mutation
@@ -384,6 +481,11 @@ func (_u *UserUpdateOne) check() error {
 			return &ValidationError{Name: "role", err: fmt.Errorf(`ent: validator failed for field "User.role": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.RoleSource(); ok {
+		if err := user.RoleSourceValidator(v); err != nil {
+			return &ValidationError{Name: "role_source", err: fmt.Errorf(`ent: validator failed for field "User.role_source": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -436,6 +538,18 @@ func (_u *UserUpdateOne) sqlSave(ctx context.Context) (_node *User, err error) {
 	}
 	if value, ok := _u.mutation.Role(); ok {
 		_spec.SetField(user.FieldRole, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.Issuer(); ok {
+		_spec.SetField(user.FieldIssuer, field.TypeString, value)
+	}
+	if _u.mutation.IssuerCleared() {
+		_spec.ClearField(user.FieldIssuer, field.TypeString)
+	}
+	if value, ok := _u.mutation.RoleSource(); ok {
+		_spec.SetField(user.FieldRoleSource, field.TypeEnum, value)
+	}
+	if _u.mutation.RoleSourceCleared() {
+		_spec.ClearField(user.FieldRoleSource, field.TypeEnum)
 	}
 	_node = &User{config: _u.config}
 	_spec.Assign = _node.assignValues

@@ -1,6 +1,6 @@
 # Orbital API Cheatsheet
 
-Copy-paste GraphQL + REST for backend services talking to Orbital on **AKS dev** (external-jwt mode). Deeper context lives in `docs/reference/`.
+Copy-paste GraphQL + REST for backend services talking to Orbital on **AKS dev** (Keycloak bearer tokens, `ORBITAL_AUTH_PROVIDERS`). Deeper context lives in `docs/reference/`.
 
 Change requests and approval policies have their own sheet: `docs/api-cheatsheet-change-control.md`.
 
@@ -47,6 +47,21 @@ mutation UpdateIdracSettings($orbId: String!, $set: IdracSettingsPatch!, $versio
 
 Do not write the version filter yourself or put `version` in `set` — orbital does
 both. Full detail: `docs/api-cheatsheet-change-control.md`.
+
+### Never put `orbId` in `set`
+
+Send only the fields you are changing. `orbId` is the identity key, and child ids embed it
+(`network-adapter-<serviceTag>-<FQDD>`, `server-maintenance-<serviceTag>`) — so "rename the
+service tag, update the orbId to match" looks tidy and quietly breaks the graph.
+
+`ServerPatch` and its siblings currently **accept** `orbId`, and a write that changes it re-keys
+the node: the old id stops resolving, children are orphaned, and every diff, export preview and
+change-request base capture reads it as one node deleted and another created. Nothing warns.
+Verified 2026-09-22; tracked in `docs/planning/debt.md`.
+
+Orbital does enforce the other half — a write must target exactly one row **by orbId**. An empty
+filter, or a filter on any other field, is refused with `VARIABLE_FORM_REQUIRED`, so a mass update
+is not reachable through the API.
 
 ### Clearing a field — use `remove` (with a `set`)
 
@@ -159,12 +174,12 @@ response
 ```graphql
 query {
   getDataCenter(orbId: "houston:houston-galleon") {
-    servers { orbId name hostname model serviceTag rackPosition }
+    servers { orbId name hostname model serviceTag serialNumber rackPosition }
   }
 }
 ```
 
-### Fetch a server's iDRAC settings — by server orbId
+### Fetch a server's iDRAC settings
 ```graphql
 query {
   getServer(orbId: "houston:BB52FZ3") {
@@ -186,6 +201,19 @@ mutation UpdateIdracSettings($orbId: String!, $set: IdracSettingsPatch!) {
 variables
 ```json
 { "orbId": "houston:BB52FZ3-idrac", "version": 7, "set": { "sshEnabled": false } }
+```
+
+### Update a server field
+
+This example updates the `serialNumber` for server.
+```graphql
+mutation UpdateServer($orbId: String!, $set: ServerPatch!) {
+  updateServer(input: { filter: { orbId: { eq: $orbId } }, set: $set }) { numUids }
+}
+```
+variables
+```json
+{ "orbId": "houston:server-BB52FZ3", "version": 1, "set": { "serialNumber": "MXFC400359006Z" } }
 ```
 
 ## Clusters

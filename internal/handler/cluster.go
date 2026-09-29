@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/armada/orbital/internal/configitems"
+	"github.com/armada/orbital/internal/web/data/component"
 	"github.com/armada/orbital/internal/web/data/layout"
 	"github.com/labstack/echo/v4"
 )
@@ -71,7 +72,7 @@ const getClusterQuery = `
   }`
 
 type ClusterHandler struct {
-	dev       bool
+	hotReload bool
 	dgraphURL string
 	fragment  *template.Template
 	logger    *slog.Logger
@@ -87,10 +88,10 @@ type ClusterHandler struct {
 // NewClusterHandler builds a cluster Tab handler. `actions` is required:
 // the same DGraph query + render path serves orbital (role-based actions)
 // and orb (read-only OrbActions); the caller injects the policy.
-func NewClusterHandler(dgraphURL string, dev bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *ClusterHandler {
+func NewClusterHandler(dgraphURL string, hotReload bool, logger *slog.Logger, basePath string, actions func(echo.Context) layout.PageActions) *ClusterHandler {
 	return &ClusterHandler{
 		dgraphURL: dgraphURL,
-		dev:       dev,
+		hotReload: hotReload,
 		fragment:  parseClusterFragment(),
 		logger:    logger,
 		basePath:  basePath,
@@ -102,7 +103,8 @@ func parseClusterFragment() *template.Template {
 	return template.Must(template.ParseFiles(
 		"web/templates/shared/partials/cluster-tab.gohtml",
 		"web/templates/shared/partials/audit-tab.gohtml",
-		"web/templates/shared/components/edit-modal-cluster.gohtml",
+		"web/templates/shared/components/metadata-box.gohtml",
+		"web/templates/shared/components/edit-modal.gohtml",
 	))
 }
 
@@ -313,6 +315,10 @@ type clusterTabData struct {
 	// AuditPanelID matches data-panel on the audit <li> and the id of the
 	// placeholder <div>. Consumed by the shared audit-tab partial.
 	AuditPanelID string
+
+	// EditModal is the shared edit-modal render context (one template for
+	// every parent family) — see component.EditModal.
+	EditModal component.EditModal
 }
 
 func (h *ClusterHandler) Tab(c echo.Context) error {
@@ -320,7 +326,7 @@ func (h *ClusterHandler) Tab(c echo.Context) error {
 		return c.Redirect(http.StatusFound, h.basePath+"/")
 	}
 
-	if h.dev {
+	if h.hotReload {
 		time.Sleep(150 * time.Millisecond)
 	}
 
@@ -559,10 +565,16 @@ func (h *ClusterHandler) Tab(c echo.Context) error {
 	tab.AuditPanelID = "cluster-panel-audit-" + tab.DomID
 
 	tmpl := h.fragment
-	if h.dev {
+	if h.hotReload {
 		tmpl = parseClusterFragment()
 	}
 
 	c.Response().Header().Set("Content-Type", "text/html; charset=utf-8")
+	tab.EditModal = component.EditModal{
+		Prefix: "cluster", Title: "Edit " + tab.Provider + ": " + tab.Name,
+		DomID: tab.DomID, OrbID: tab.OrbID, Version: tab.Version,
+		CurrentUser: tab.CurrentUser, Typename: tab.Typename,
+		EditDataJSON: tab.EditDataJSON, EditTargetsJSON: tab.EditTargetsJSON,
+	}
 	return renderHTML(c, tmpl, "", tab)
 }

@@ -33,7 +33,8 @@ func RoleAtLeast(actual, minimum user.Role) bool {
 type callerRole struct {
 	// Role is empty only when NoAuthz is true or Reason is set.
 	Role user.Role
-	// Source is "context" (pre-mapped external-JWT claim) or "user" (users
+	// Source is "context" (a role assigned by the provider, e.g. a
+	// delegatedAuthorization caller) or "user" (users
 	// table). Used for log/error wording.
 	Source string
 	// NoAuthz means no authz backend is configured at all (nil db) — local dev
@@ -46,8 +47,8 @@ type callerRole struct {
 
 // resolveCallerRole reads the caller's role. Three caller shapes, checked in
 // order:
-//   - External-JWT callers (ORBITAL_AUTH_MODE=external-jwt) carry a pre-mapped
-//     role in context and have NO users-table row, so there is no user_id to
+//   - Callers carrying a role on the context (a delegatedAuthorization provider) have a
+//     pre-mapped role in context and have NO users-table row, so there is no user_id to
 //     look up — honor the context role directly. Mirrors the short-circuit in
 //     RequireRole; without it, AEP/Keycloak clients get 403 on every config
 //     mutation even though they map to admin.
@@ -162,17 +163,22 @@ func ResolveUser(db *ent.Client, adminEmails map[string]struct{}) echo.Middlewar
 			if id, _ := c.Get("user_id").(int); id != 0 {
 				return next(c) // session auth already resolved
 			}
-			// External-JWT callers (ORBITAL_AUTH_MODE=external-jwt) carry a
-			// pre-mapped role and are intentionally NOT provisioned into the
-			// users table. Skip the lookup/provision so RequireRole's role
-			// short-circuit governs them.
+			// A caller whose role came from its provider (delegatedAuthorization) is
+			// intentionally NOT provisioned into the users table — its
+			// authorization happened upstream. Skip the lookup/provision so
+			// RequireRole's role short-circuit governs it.
 			if role, _ := c.Get("role").(string); role != "" {
 				return next(c)
 			}
 			// App-only (client credentials) tokens have no email and no users-table
-			// row, by design — the appid allowlist in BearerVerifier is the authz
-			// gate. Pass through without a DB lookup. See ADR 010.
-			if name, _ := c.Get("user_name").(string); strings.HasPrefix(name, auth.AppPrincipalPrefix) {
+			// row, by design — the matching provider entry's clientID is the
+			// authz gate. Pass through without a DB lookup.
+			//
+			// Keyed on the marker the verifier set, NOT on the "app:" name
+			// prefix: user_name comes from the token's unvalidated `name` claim,
+			// so prefix-matching let a human token classify itself as a machine
+			// and take this branch, skipping both provisioning and its role.
+			if auth.IsAppPrincipal(c) {
 				return next(c)
 			}
 			email, _ := c.Get("user_email").(string)
@@ -181,20 +187,104 @@ func ResolveUser(db *ent.Client, adminEmails map[string]struct{}) echo.Middlewar
 				return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized")
 			}
 			ctx := c.Request().Context()
+			// Multi-provider role handling (Spike 26). Mode B sets provider_role
+			// and is authoritative at every login; mode A sets
+			// provider_default_role, which only seeds a NEW user and never
+			// overwrites what the table already holds.
+			providerRole, _ := c.Get("provider_role").(string)
+			providerGroup, _ := c.Get("provider_role_group").(string)
+			providerDefault, _ := c.Get("provider_default_role").(string)
+
 			u, err := db.User.Query().Where(user.Email(email)).Only(ctx)
 			if err != nil {
-				// Provision on first bearer login, same as OIDC flow.
-				u, err = db.User.Create().
+				newRole := RoleForEmail(email, adminEmails)
+				switch {
+				case providerRole != "":
+					// Groups own the role for this provider. ORBITAL_ADMIN_EMAILS
+					// deliberately does not apply — a second mechanism that can
+					// grant admin outside the mapping would defeat the mapping.
+					newRole = user.Role(providerRole)
+				case providerDefault != "":
+					if _, isAdmin := adminEmails[email]; !isAdmin {
+						newRole = user.Role(providerDefault)
+					}
+				}
+				create := db.User.Create().
 					SetEmail(email).
 					SetName(email).
 					SetPreferredUsername(email).
 					SetVerified(true).
-					SetRole(RoleForEmail(email, adminEmails)).
-					Save(ctx)
+					SetRole(newRole)
+				if providerRole != "" {
+					create = create.SetRoleSource(user.RoleSourceProvider)
+				}
+				if iss, _ := c.Get("auth_issuer").(string); iss != "" {
+					create = create.SetIssuer(iss)
+				}
+				u, err = create.Save(ctx)
 				if err != nil {
 					slog.Default().Warn("ResolveUser: failed to provision user", "email", email, "err", err)
 					return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized")
 				}
+			} else if iss, _ := c.Get("auth_issuer").(string); iss != "" && u.Issuer == nil && u.PasswordHash == nil {
+				// Unowned and never a local account — claim it for this provider.
+				// This is the migration path for rows predating the issuer
+				// column: without it every existing user is locked out of SSO
+				// until an admin backfills.
+				//
+				// BOTH conditions are load-bearing. A row with a password is a
+				// local account and stays unclaimable however old it is, which
+				// is what keeps the break-glass admin out of a provider's reach.
+				// The branch stops firing permanently once a row has an issuer.
+				if updated, uerr := u.Update().SetIssuer(iss).Save(ctx); uerr == nil {
+					u = updated
+				} else {
+					slog.Default().Warn("could not claim unowned user for provider", "email", email, "err", uerr)
+					return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized")
+				}
+			} else if iss, _ := c.Get("auth_issuer").(string); iss != "" && (u.Issuer == nil || *u.Issuer != iss) {
+				// A provider may only resolve rows it owns. It never CLAIMS an
+				// existing row — otherwise any configured provider could mint a
+				// token for an existing address and inherit that user's role,
+				// including a local break-glass admin. Refuse instead.
+				//
+				// This refusal exists because orbital keys users by EMAIL, which
+				// OIDC explicitly says is mutable, reusable and falsifiable. The
+				// correct key is (iss, sub) via an identity-link table — how
+				// Keycloak, Auth0 and django-social-auth all do it — at which
+				// point one person can hold links to several providers and this
+				// conflict stops existing. Tracked in docs/planning/backlog.md.
+				owner := "a local account"
+				if u.Issuer != nil {
+					owner = *u.Issuer
+				}
+				slog.Default().Warn("bearer token rejected — identity already belongs to another principal",
+					"email", email, "token_issuer", iss, "row_owner", owner)
+				return echo.NewHTTPError(http.StatusUnauthorized, "identity conflict")
+			} else if providerRole != "" && string(u.Role) != providerRole && providerRoleApplies(c, u) {
+				// The provider owns the role and it moved. Record the transition,
+				// not the evaluation: most logins change nothing, and an event
+				// per login is noise that trains people to ignore the record.
+				before := string(u.Role)
+				upd := u.Update().SetRole(user.Role(providerRole)).SetRoleSource(user.RoleSourceProvider)
+				if iss, _ := c.Get("auth_issuer").(string); iss != "" {
+					upd = upd.SetIssuer(iss)
+				}
+				updated, uerr := upd.Save(ctx)
+				if uerr != nil {
+					slog.Default().Warn("ResolveUser: failed to apply provider role", "email", email, "err", uerr)
+					return echo.NewHTTPError(http.StatusUnauthorized, "unauthorized")
+				}
+				u = updated
+				issuer, _ := c.Get("auth_issuer").(string)
+				writeAuditEvent(db, slog.Default(), "management", email, "providerRoleChange",
+					[]string{"providerRoleChange"}, []string{"User"}, []string{email},
+					map[string]any{
+						"before": before, "after": providerRole,
+						"provider": issuer, "group": providerGroup,
+					},
+					originFromContext(c, "bearer"),
+				)
 			}
 			c.Set("user_id", u.ID)
 			// This is the bearer path — the production one. RequireRole and the
@@ -220,10 +310,9 @@ func RequireRole(db *ent.Client, minRole user.Role) echo.MiddlewareFunc {
 			if db == nil {
 				return next(c)
 			}
-			// External-JWT callers (ORBITAL_AUTH_MODE=external-jwt) carry a
-			// pre-mapped role from the middleware, since they aren't provisioned
-			// into orbital's users table. Trust it directly and skip the DB
-			// lookup below.
+			// A delegated-authorization caller carries a pre-mapped role from the
+			// middleware, since it is not provisioned into orbital's users
+			// table. Trust it directly and skip the DB lookup below.
 			if roleStr, _ := c.Get("role").(string); roleStr != "" {
 				if RoleAtLeast(user.Role(roleStr), minRole) {
 					return next(c)
@@ -234,21 +323,21 @@ func RequireRole(db *ent.Client, minRole user.Role) echo.MiddlewareFunc {
 					"uri", c.Request().URL.Path,
 					"required_role", string(minRole),
 					"user_role", roleStr,
-					"reason", "external_jwt_role_below_required",
+					"reason", "context_role_below_required",
 				)
 				return echo.NewHTTPError(http.StatusForbidden, fmt.Sprintf("role %q is below required %q for this action", roleStr, minRole))
 			}
 			// App-only (client credentials) callers were authenticated by the
-			// BearerVerifier allowlist (ORBITAL_APP_TOKEN_ALLOWED_APPIDS). MVP
-			// policy: any allowlist-passed app caller is treated as `dev`-
-			// equivalent — sufficient for all mutating API routes today. Future
-			// best practice: check the `roles` claim against required role using
-			// Microsoft Entra App Roles, once Application Administrator perms
-			// allow defining them. See ADR 010 §App Caller Authorization.
-			if name, _ := c.Get("user_name").(string); strings.HasPrefix(name, auth.AppPrincipalPrefix) {
+			// provider entry whose clientID matched their azp. MVP policy: any
+			// such app caller is treated as `dev`-equivalent — sufficient for
+			// all mutating API routes today. Future best practice: check a
+			// roles claim against the required role, once the provider can
+			// allow defining them. See AUTH.md § App callers.
+			if auth.IsAppPrincipal(c) {
 				if RoleAtLeast(user.RoleDev, minRole) {
 					return next(c)
 				}
+				name, _ := c.Get("user_name").(string)
 				slog.Default().Warn("authorization denied",
 					"actor", name,
 					"method", c.Request().Method,
@@ -312,4 +401,21 @@ func RequireRole(db *ent.Client, minRole user.Role) echo.MiddlewareFunc {
 // Kept for backwards compatibility with existing tests and call sites.
 func RequireAdmin(db *ent.Client) echo.MiddlewareFunc {
 	return RequireRole(db, user.RoleAdmin)
+}
+
+// providerRoleApplies reports whether a provider-derived role should overwrite
+// what the users table holds.
+//
+// A MATCHED group is explicit and always wins — being added to orbital-admin
+// says so regardless of what an admin set before. The FLOOR (defaultRole when
+// nothing matched) only applies when the provider already owned this role;
+// otherwise it would revert a role an admin deliberately set on someone the
+// mapping never covered, which is the case that made "authoritative fallback"
+// wrong on its own.
+func providerRoleApplies(c echo.Context, u *ent.User) bool {
+	floored, _ := c.Get("provider_role_floored").(bool)
+	if !floored {
+		return true
+	}
+	return u.RoleSource != nil && *u.RoleSource == user.RoleSourceProvider
 }

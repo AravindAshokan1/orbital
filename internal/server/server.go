@@ -162,7 +162,6 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		},
 	}))
 
-	externalJWTMode := cfg.AuthMode == "external-jwt"
 	oidcEnabled := cfg.OIDCIssuerURL != "" && cfg.OIDCClientSecret != ""
 	if cfg.OIDCIssuerURL != "" && cfg.OIDCClientSecret == "" {
 		logger.Warn("ORBITAL_OIDC_CLIENT_SECRET is not set — SSO login disabled")
@@ -175,79 +174,44 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 	// API surface stay in sync.
 	//
 	// Three modes:
-	//   - external-jwt (ORBITAL_AUTH_MODE=external-jwt): API/GraphQL requests
-	//     accept a bearer signed by ORBITAL_JWT_ISSUER (assigned
-	//     ORBITAL_JWT_DEFAULT_ROLE via context) OR a session cookie (role
-	//     resolved from the DB). The session fallback keeps orbital's own UI
-	//     usable — humans sign in via local/OIDC login; AEP's proxied calls
-	//     carry a bearer. Login routes stay registered (oidcEnabled unchanged).
-	//     See AUTH.md § External JWT mode.
-	//   - Dev (cfg.Dev=true): apiAuth stays empty so machine-to-machine
+	//   - Multi-provider (ORBITAL_AUTH_PROVIDERS): bearer tokens are verified
+	//     against a list of trusted providers, each selected by the token's
+	//     (iss, azp). A session cookie still serves orbital's own UI, since a
+	//     browser cannot attach a bearer to a plain page navigation.
+	//     See AUTH.md § Multiple identity providers.
+	//   - Dev (cfg.TemplateHotReload=true): apiAuth stays empty so machine-to-machine
 	//     callers like cb-bundler can query /graphql plain-HTTP. Session
 	//     middleware still populates user info for the UI.
 	//   - Production OIDC (Dev=false, OIDCIssuerURL set): strict bearer
 	//     verification + user resolution against PostgreSQL.
 	var apiAuth []echo.MiddlewareFunc
 	switch {
-	case externalJWTMode:
-		// Build the AAD bearer verifier as a fallback so internal service
-		// callers (in-pod cb-bundler, AAD client-credentials) keep working.
-		// external-jwt ADDS Keycloak-user acceptance; it must not remove the
-		// AAD service-token path the bundler's publish callback depends on.
-		var fallback *auth.BearerVerifier
-		if cfg.OIDCIssuerURL != "" {
-			if bv, err := auth.NewBearerVerifier(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.AppTokenAllowedAppIDs); err != nil {
-				logger.Warn("external-jwt: AAD fallback verifier init failed — internal service callers (bundler) will fail auth", "err", err)
-			} else {
-				fallback = bv
-			}
-		}
-		ejv, err := auth.NewExternalJWTVerifier(context.Background(), auth.ExternalJWTConfig{
-			IssuerURL:   cfg.JWTIssuer,
-			Audience:    cfg.JWTAudience,
-			ClientID:    cfg.JWTClientID,
-			DefaultRole: cfg.JWTDefaultRole,
-			Fallback:    fallback,
-		})
+	case len(cfg.AuthProviders) > 0:
+		// When configured this is the SOLE source of bearer verification, so
+		// there is no second path to disagree with it.
+		// ORBITAL_OIDC_* still drives the browser login flow, which is a
+		// different job: there orbital is an OAuth client, here a resource
+		// server.
+		ps, err := auth.NewProviderSet(context.Background(), authProviderSpecs(cfg), logger)
 		if err != nil {
-			logger.Error("external-jwt verifier init failed — API auth disabled", "err", err)
-		} else {
-			// Every bearer caller gets this one tier, so an operator who never
-			// set it should see that they inherited it rather than chose it.
-			// Warned, not refused: readonly is a safe fallback, and refusing to
-			// boot is for guarantees with no safe default (see apiAuth below).
-			_, roleWasSet := os.LookupEnv("ORBITAL_JWT_DEFAULT_ROLE")
-			if !roleWasSet {
-				logger.Warn("ORBITAL_JWT_DEFAULT_ROLE not set — defaulting to "+cfg.JWTDefaultRole+"; every valid bearer token receives this role. Set it explicitly to choose the tier.",
-					"role", cfg.JWTDefaultRole, "explicitly_set", false)
-			}
-			logger.Warn("ORBITAL_AUTH_MODE=external-jwt — Keycloak bearers (issuer "+cfg.JWTIssuer+") map to role "+cfg.JWTDefaultRole+"; other issuers fall back to AAD bearer auth. Intended for demo/dev; do not use in production without per-user role mapping.",
-				"issuer", cfg.JWTIssuer, "audience", cfg.JWTAudience, "client_id", cfg.JWTClientID,
-				"aad_fallback", fallback != nil, "role_explicitly_set", roleWasSet)
-			apiAuth = []echo.MiddlewareFunc{ejv.RequireAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
-		}
-	case cfg.OIDCIssuerURL != "":
-		bv, err := auth.NewBearerVerifier(context.Background(), cfg.OIDCIssuerURL, cfg.OIDCClientID, cfg.AppTokenAllowedAppIDs)
-		if err != nil {
-			logger.Warn("bearer verifier init failed — API auth disabled", "err", err)
+			logger.Error("auth provider set init failed — API auth disabled", "err", err)
 		} else if !cfg.APIAuthEnabled {
-			logger.Warn("API auth disabled by "+cfg.APIAuthSource()+" — bearer verification on /api/v1 and /graphql is BYPASSED; session-cookie auth remains. Set ORBITAL_API_AUTH_ENABLED=true to verify bearers without giving up template hot-reload.",
-				"decided_by", cfg.APIAuthSource(), "dev", cfg.Dev)
-			// apiAuth stays nil — session middleware sets user info for UI;
-			// unauthenticated callers (cb-bundler) pass through to handlers
-			// which decide based on operation type (mutations require user_id).
+			logger.Warn("API auth disabled by "+cfg.APIAuthSource()+" — bearer verification on /api/v1 and /graphql is BYPASSED",
+				"decided_by", cfg.APIAuthSource())
 		} else {
-			apiAuth = []echo.MiddlewareFunc{bv.RequireAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
+			// Each provider entry's clientID is the gate: a token whose azp
+			// matches no entry is refused before any role logic runs.
+			logger.Info("multi-provider bearer auth enabled", "issuers", ps.Issuers())
+			apiAuth = []echo.MiddlewareFunc{ps.RequireAuth(), auth.RequireCSRFOnCookieAuth(), handler.ResolveUser(db, cfg.AdminEmailSet())}
 		}
 	default:
-		logger.Warn("ORBITAL_OIDC_ISSUER_URL is not set — API auth disabled")
+		logger.Warn("ORBITAL_AUTH_PROVIDERS is not set — API auth disabled. Bearer verification exists only through the provider list; ORBITAL_OIDC_* configures the browser login flow, which is a different job.")
 	}
 
 	// An operator who explicitly set ORBITAL_API_AUTH_ENABLED=false means it in
 	// every auth mode. Applied here rather than inside the switch so no mode can
-	// be forgotten. Inherited-false is deliberately NOT applied: external-jwt
-	// never consulted Dev, and making it do so now would silently turn auth off
-	// for anyone running that mode locally.
+	// be forgotten. Inherited-false is deliberately NOT applied here: it is
+	// resolved once in config.New, so a mode cannot quietly opt itself out.
 	if cfg.APIAuthExplicitlyDisabled() {
 		apiAuth = nil
 	}
@@ -257,30 +221,34 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 	// infer the active mode from the presence/absence of a mode-specific
 	// banner above — an empty apiAuth means unauthenticated requests are
 	// accepted, which is the most dangerous state and must be loud.
-	authMode := "oidc"
-	switch {
-	case externalJWTMode:
-		authMode = "external-jwt"
-	case !oidcEnabled:
-		authMode = "none"
+	authMode := "none"
+	if len(cfg.AuthProviders) > 0 {
+		authMode = "providers"
 	}
 	if len(apiAuth) == 0 {
 		logger.Warn("auth: API AUTHENTICATION DISABLED — /graphql and /api/v1 accept unauthenticated requests; only session-identity mutations are gated",
-			"mode", authMode, "enabled", false, "decided_by", cfg.APIAuthSource(), "dev", cfg.Dev)
+			"mode", authMode, "enabled", false, "decided_by", cfg.APIAuthSource())
 	} else {
 		logger.Info("auth: API authentication enabled",
-			"mode", authMode, "enabled", true, "decided_by", cfg.APIAuthSource(), "dev", cfg.Dev)
+			"mode", authMode, "enabled", true, "decided_by", cfg.APIAuthSource())
 	}
 
 	// Fail-closed in production. An empty apiAuth means /graphql and /api/v1
-	// accept unauthenticated requests — acceptable only in dev (cfg.Dev), where
+	// accept unauthenticated requests — acceptable only in dev (cfg.TemplateHotReload), where
 	// bearer auth is intentionally bypassed (see the switch above). In
 	// production this state must abort startup rather than silently degrade to
 	// no-auth, whatever the cause: OIDC discovery unreachable at boot, a
 	// verifier-init error, or an unset issuer. The preceding WARN carries the
 	// specific reason. (audit S.16)
+	// Say it out loud: an ephemeral key means every restart logs everyone out,
+	// which otherwise reads as a session bug.
+	if cfg.SessionKeyEphemeral() {
+		logger.Warn("ORBITAL_SESSION_HMAC_KEY is not set — generated an ephemeral key; sessions will not survive a restart",
+			"fix", "set ORBITAL_SESSION_HMAC_KEY (make run-orbital writes deploy/local/session-hmac.key)")
+	}
+
 	if cfg.APIAuthEnabled && len(apiAuth) == 0 {
-		return nil, fmt.Errorf("refusing to start: API authentication is required (per %s) but could not be enabled — ensure ORBITAL_OIDC_ISSUER_URL is set and OIDC discovery is reachable at startup", cfg.APIAuthSource())
+		return nil, fmt.Errorf("refusing to start: API authentication is required (per %s) but could not be enabled — set ORBITAL_AUTH_PROVIDERS and ensure each provider's OIDC discovery is reachable at startup", cfg.APIAuthSource())
 	}
 
 	// Default API group — dev+ required for mutating methods (POST/PUT/PATCH/DELETE).
@@ -323,10 +291,19 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 		logger.Warn("OCI publishing not configured (ORBITAL_OCI_REGISTRY and ORBITAL_OCI_SIGNING_KEY_PATH) — publish disabled")
 	}
 
-	ui := handler.NewUI(cfg.Dev, cfg.RatelURL, cfg.IssueTrackerURL, oidcEnabled, s3Configured, cfg.S3Endpoint, cfg.S3Bucket, cfg.BasePath, db, logger)
+	ui := handler.NewUI(cfg.TemplateHotReload, cfg.RatelURL, cfg.IssueTrackerURL, oidcEnabled, s3Configured, cfg.S3Endpoint, cfg.S3Bucket, cfg.BasePath, db, logger)
+	ui.SetOIDCBranding(cfg.OIDCDisplayName, cfg.OIDCIconURL)
 	ui.SetOCIConfig(ociConfigured, cfg.OCIRegistry, cfg.OCIRepo)
 	ui.SetExportDir(cfg.ExportDir)
 	ui.SetSchemaPath(cfg.SchemaPath)
+	// Users whose role comes from a provider's groups render read-only.
+	roleOwning := map[string]struct{}{}
+	for _, p := range cfg.AuthProviders {
+		if len(p.RoleMapping) > 0 {
+			roleOwning[p.Issuer.URL] = struct{}{}
+		}
+	}
+	ui.SetRoleOwningIssuers(roleOwning)
 	ui.SetDGraphURL(cfg.DGraphURL)
 	ui.SetDGraphAdminURL(cfg.DGraphAdminURL)
 	ui.SetBackupCronSpec(cfg.BackupSchedule)
@@ -397,34 +374,55 @@ func New(cfg *config.Config, db *ent.Client, rawDB *sql.DB) (*Server, error) {
 			if err != nil {
 				logger.Error("oidc provider init failed", "err", err)
 			} else {
+				// If the browser login provider is ALSO in ORBITAL_AUTH_PROVIDERS
+				// with a roleMapping, that provider owns roles — so a session
+				// gets the same role a bearer token from the same identity would.
+				// Without this, one person from one provider ends up with two
+				// different roles depending on how they arrived.
+				for _, p := range cfg.AuthProviders {
+					if p.Issuer.URL != cfg.OIDCIssuerURL || len(p.RoleMapping) == 0 {
+						continue
+					}
+					rules := make([]struct{ Group, Role string }, 0, len(p.RoleMapping))
+					for _, r := range p.RoleMapping {
+						rules = append(rules, struct{ Group, Role string }{r.Group, r.Role})
+					}
+					if m := auth.NewRoleMapper(p.ClaimMappings.Groups.Claim, rules); m != nil {
+						oidc.SetRoleMapper(m, p.DefaultRole)
+						logger.Info("browser login roles come from the provider's group claim",
+							"issuer", p.Issuer.URL, "claim", p.ClaimMappings.Groups.Claim,
+							"no_match", map[bool]string{true: "refuse", false: "defaultRole=" + p.DefaultRole}[p.DefaultRole == ""])
+					}
+					break
+				}
 				root.GET("/auth/login", oidc.Login)
 				root.GET("/auth/callback", oidc.Callback)
 			}
 		}
 	}
 
-	dc := handler.NewDataCenter(cfg.DGraphURL, cfg.Dev, logger, cfg.BasePath,
+	dc := handler.NewDataCenter(cfg.DGraphURL, cfg.TemplateHotReload, logger, cfg.BasePath,
 		func(c echo.Context) layout.PageActions {
 			canMutate, _ := c.Get("can_mutate").(bool)
 			return layout.OrbitalActions(canMutate)
 		})
 	root.GET("/datacenters/:orbId", dc.Tab)
 
-	srv := handler.NewServerHandler(cfg.DGraphURL, cfg.Dev, logger, cfg.BasePath,
+	srv := handler.NewServerHandler(cfg.DGraphURL, cfg.TemplateHotReload, logger, cfg.BasePath,
 		func(c echo.Context) layout.PageActions {
 			canMutate, _ := c.Get("can_mutate").(bool)
 			return layout.OrbitalActions(canMutate)
 		})
 	root.GET("/servers/:orbId", srv.Tab)
 
-	cluster := handler.NewClusterHandler(cfg.DGraphURL, cfg.Dev, logger, cfg.BasePath,
+	cluster := handler.NewClusterHandler(cfg.DGraphURL, cfg.TemplateHotReload, logger, cfg.BasePath,
 		func(c echo.Context) layout.PageActions {
 			canMutate, _ := c.Get("can_mutate").(bool)
 			return layout.OrbitalActions(canMutate)
 		})
 	root.GET("/clusters/:orbId", cluster.Tab)
 
-	networkDevice := handler.NewNetworkDeviceHandler(cfg.DGraphURL, cfg.Dev, logger, cfg.BasePath,
+	networkDevice := handler.NewNetworkDeviceHandler(cfg.DGraphURL, cfg.TemplateHotReload, logger, cfg.BasePath,
 		func(c echo.Context) layout.PageActions {
 			canMutate, _ := c.Get("can_mutate").(bool)
 			return layout.OrbitalActions(canMutate)
@@ -719,4 +717,30 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// authProviderSpecs maps the decoded config into the auth package's runtime
+// shape, so internal/auth does not import internal/config.
+func authProviderSpecs(cfg *config.Config) []auth.ProviderSpec {
+	specs := make([]auth.ProviderSpec, 0, len(cfg.AuthProviders))
+	for _, p := range cfg.AuthProviders {
+		s := auth.ProviderSpec{
+			IssuerURL:            p.Issuer.URL,
+			ClientID:             p.ClientID,
+			Audiences:            p.Issuer.Audiences,
+			CertificateAuthority: p.Issuer.CertificateAuthority,
+			SelfClientID:         cfg.OIDCClientID,
+			UsernameClaim:        p.ClaimMappings.Username.Claim,
+			GroupsClaim:          p.ClaimMappings.Groups.Claim,
+			DefaultRole:          p.DefaultRole,
+		}
+		if p.DelegatedAuthorization != nil {
+			s.DelegatedRole = p.DelegatedAuthorization.Role
+		}
+		for _, r := range p.RoleMapping {
+			s.RoleMapping = append(s.RoleMapping, struct{ Group, Role string }{r.Group, r.Role})
+		}
+		specs = append(specs, s)
+	}
+	return specs
 }
