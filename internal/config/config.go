@@ -77,7 +77,7 @@ type Config struct {
 	S3Bucket                string `envconfig:"ORBITAL_S3_BUCKET"               default:"orbital"`
 	S3AccessKey             string `envconfig:"ORBITAL_S3_ACCESS_KEY"           default:"minioadmin"`
 	S3SecretKey             string `envconfig:"ORBITAL_S3_SECRET_KEY"           default:"minioadmin"`
-  S3UseAzMI               bool   `envconfig:"ORBITAL_S3_USE_AZ_MI"            default:"false"`
+	S3UseAzMI               bool   `envconfig:"ORBITAL_S3_USE_AZ_MI"            default:"false"`
 	S3Prefix                string `envconfig:"ORBITAL_S3_PREFIX"                default:"backups/"` // optional path prefix within the bucket
 	S3RetentionCount        int    `envconfig:"ORBITAL_S3_RETENTION_COUNT"       default:"0"`        // deprecated: use ORBITAL_BACKUP_RETENTION_MIN_COUNT
 	BackupRetentionDays     int    `envconfig:"ORBITAL_BACKUP_RETENTION_DAYS"    default:"14"`       // delete backups older than N days; 0 = no time-based pruning
@@ -290,7 +290,7 @@ func New() (*Config, error) {
 	}
 	cfg.APIAuthEnabled = true
 	cfg.apiAuthSource = "default (fail-safe)"
-  
+
 	if raw := cfg.APIAuthEnabledRaw; raw != "" {
 		enabled, err := strconv.ParseBool(raw)
 		if err != nil {
